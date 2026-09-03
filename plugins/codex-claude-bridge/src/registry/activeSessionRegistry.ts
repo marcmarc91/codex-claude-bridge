@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { connect } from "node:net";
-import { chmod, lstat, mkdir, open, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
@@ -21,6 +21,14 @@ const activeSessionRecordSchema = z.object({
   if (record.runtime === "codex" && record.socketPath !== undefined) context.addIssue({ code: z.ZodIssueCode.custom, message: "Codex sessions cannot have a socket path" });
 });
 
+const sessionLockMetadataSchema = z.object({
+  ownerId: uuidSchema,
+  processId: z.number().int().safe().positive(),
+  acquiredAt: z.string().datetime({ offset: true }),
+}).strict();
+
+const lockMetadataGraceMilliseconds = 500;
+
 function contained(parent: string, candidate: string): boolean { const child = relative(resolve(parent), resolve(candidate)); return child !== ".." && !child.startsWith(`..${sep}`) && !isAbsolute(child); }
 function registry(stateHome: string | undefined, projectId: string): string { const root = resolveBridgeStateDirectory(stateHome); return resolveSessionRegistryDirectory(dirname(root), projectIdentitySchema.parse(projectId)); }
 function recordPath(directory: string, sessionId: string): string { const path = join(directory, `${uuidSchema.parse(sessionId)}.json`); if (!contained(directory, path)) throw new RangeError("Session record path must remain within its registry directory"); return path; }
@@ -28,14 +36,41 @@ function lockPath(directory: string, sessionId: string): string { const path = j
 function parseRecord(input: unknown, stateHome?: string): ActiveSessionRecord | undefined { const parsed = activeSessionRecordSchema.safeParse(input); if (!parsed.success || (parsed.data.socketPath !== undefined && !contained(resolveBridgeStateDirectory(stateHome), parsed.data.socketPath))) return undefined; return parsed.data; }
 async function privateDirectory(path: string): Promise<void> { await mkdir(path, { recursive: true, mode: 0o700 }); await chmod(path, 0o700); }
 
+async function secureExistingBridgePath(bridgeStateDirectory: string, existingPath: string): Promise<boolean> {
+  if (!contained(bridgeStateDirectory, existingPath)) return false;
+  const relativeSegments = relative(resolve(bridgeStateDirectory), resolve(existingPath)).split(sep).filter(Boolean);
+  let inspectedPath = resolve(bridgeStateDirectory);
+  try {
+    if ((await lstat(inspectedPath)).isSymbolicLink()) return false;
+    for (const pathSegment of relativeSegments) {
+      inspectedPath = join(inspectedPath, pathSegment);
+      if ((await lstat(inspectedPath)).isSymbolicLink()) return false;
+    }
+    return contained(await realpath(bridgeStateDirectory), await realpath(existingPath));
+  } catch { return false; }
+}
+
+async function recoverStaleLock(lockDirectory: string, ownerPath: string): Promise<void> {
+  const bridgeStateDirectory = dirname(dirname(dirname(dirname(lockDirectory))));
+  if (!(await secureExistingBridgePath(bridgeStateDirectory, lockDirectory))) return;
+  let lockMetadata: z.infer<typeof sessionLockMetadataSchema> | undefined;
+  try { lockMetadata = sessionLockMetadataSchema.parse(JSON.parse(await readFile(ownerPath, "utf8"))); } catch { lockMetadata = undefined; }
+  const lockStatus = await lstat(lockDirectory).catch(() => undefined);
+  const metadataIsOld = lockStatus !== undefined && Date.now() - lockStatus.mtimeMs > lockMetadataGraceMilliseconds;
+  if ((lockMetadata !== undefined && !(await processActive(lockMetadata.processId))) || (lockMetadata === undefined && metadataIsOld)) {
+    const quarantineDirectory = `${lockDirectory}.quarantine-${randomUUID()}`;
+    try { await rename(lockDirectory, quarantineDirectory); await rm(quarantineDirectory, { recursive: true, force: true }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+}
+
 async function withLock<T>(directory: string, sessionId: string, operation: () => Promise<T>): Promise<T> {
   const directoryPath = lockPath(directory, sessionId); const ownerPath = join(directoryPath, "owner"); const ownerId = randomUUID();
   await privateDirectory(dirname(directoryPath));
   for (let attempt = 0; attempt < 50; attempt += 1) {
     try {
-      await mkdir(directoryPath, { mode: 0o700 }); await writeFile(ownerPath, ownerId, { mode: 0o600, flag: "wx" });
-      try { return await operation(); } finally { if (await readFile(ownerPath, "utf8").catch(() => "") === ownerId) await rm(directoryPath, { recursive: true, force: true }); }
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; await delay(10); }
+      await mkdir(directoryPath, { mode: 0o700 }); await writeFile(ownerPath, JSON.stringify({ ownerId, processId: process.pid, acquiredAt: new Date().toISOString() }), { mode: 0o600, flag: "wx" });
+      try { return await operation(); } finally { if (sessionLockMetadataSchema.safeParse(JSON.parse(await readFile(ownerPath, "utf8").catch(() => "null"))).data?.ownerId === ownerId) await rm(directoryPath, { recursive: true, force: true }); }
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; await recoverStaleLock(directoryPath, ownerPath); await delay(10); }
   }
   throw new Error("Timed out waiting for a session mutation lock");
 }
@@ -43,7 +78,7 @@ async function withLock<T>(directory: string, sessionId: string, operation: () =
 async function processActive(processId: number): Promise<boolean> { try { process.kill(processId, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; } }
 async function socketActive(path: string, stateHome?: string): Promise<boolean> {
   if (!contained(resolveBridgeStateDirectory(stateHome), path)) return false;
-  try { const status = await lstat(path); if (status.isSymbolicLink() || !status.isSocket()) return false; } catch { return false; }
+  try { const status = await lstat(path); if (status.isSymbolicLink() || !status.isSocket() || (status.mode & 0o077) !== 0 || !(await secureExistingBridgePath(resolveBridgeStateDirectory(stateHome), path))) return false; } catch { return false; }
   return new Promise((resolveProbe) => { const socket = connect(path); const timer = setTimeout(() => socket.destroy(), 200); const finish = (value: boolean) => { clearTimeout(timer); socket.destroy(); resolveProbe(value); }; socket.once("connect", () => finish(true)); socket.once("error", () => finish(false)); socket.once("close", () => finish(false)); });
 }
 async function active(record: ActiveSessionRecord, stateHome?: string): Promise<boolean> { return (await processActive(record.processId)) && (record.runtime !== "claude" || await socketActive(record.socketPath!, stateHome)); }
@@ -62,9 +97,9 @@ export async function registerActiveSession(record: ActiveSessionRecord, stateHo
   await withLock(directory, parsed.sessionId, async () => { const temporaryPath = join(directory, `.${parsed.sessionId}.${randomUUID()}.tmp`); let file: Awaited<ReturnType<typeof open>> | undefined; try { file = await open(temporaryPath, "wx", 0o600); await file.writeFile(JSON.stringify(parsed), "utf8"); await file.close(); file = undefined; await rename(temporaryPath, path); await chmod(path, 0o600); } catch (error) { if (file !== undefined) await file.close().catch(() => undefined); await rm(temporaryPath, { force: true }).catch(() => undefined); throw error; } });
 }
 
-export async function unregisterActiveSession(sessionId: string, projectId: string, stateHome?: string, expectedProcessId?: number): Promise<void> {
+export async function unregisterActiveSession(sessionId: string, projectId: string, expectedProcessId: number, stateHome?: string): Promise<void> {
   const directory = registry(stateHome, projectId); const path = recordPath(directory, sessionId);
-  await withLock(directory, sessionId, async () => { const current = await readRecord(path, stateHome); if (current !== undefined && (expectedProcessId === undefined || current.processId === expectedProcessId)) await unlink(path).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; }); });
+  await withLock(directory, sessionId, async () => { const current = await readRecord(path, stateHome); if (current !== undefined && current.processId === expectedProcessId) await unlink(path).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; }); });
 }
 
 export async function listActiveSessions(filters: ActiveSessionFilters = {}, stateHome?: string): Promise<ActiveSessionRecord[]> {

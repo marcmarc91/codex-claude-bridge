@@ -53,7 +53,7 @@ test("respinge socket-uri Claude non-socket sau symlink și păstrează înregis
   assert.deepEqual(await listActiveSessions({ projectId }, stateHomeDirectory), []);
   const freshRecord = { ...claudeRecord, runtime: "codex" as const, socketPath: undefined, processId: process.pid, displayName: "fresh" };
   await registerActiveSession(freshRecord, stateHomeDirectory);
-  await unregisterActiveSession(freshRecord.sessionId, projectId, stateHomeDirectory, process.pid + 1);
+  await unregisterActiveSession(freshRecord.sessionId, projectId, process.pid + 1, stateHomeDirectory);
   assert.equal((await findActiveSession(freshRecord.sessionId, { projectId }, stateHomeDirectory))?.displayName, "fresh");
 });
 

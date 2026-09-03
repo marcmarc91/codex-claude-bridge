@@ -102,7 +102,7 @@ test("filtrează, găsește ID-uri unice și respinge nume ambigue", async (test
   await assert.rejects(() =>
     findActiveSession("working-session", { projectId: projectIdentifier }, stateHomeDirectory),
   );
-  await unregisterActiveSession(firstRecord.sessionId, projectIdentifier, stateHomeDirectory);
+  await unregisterActiveSession(firstRecord.sessionId, projectIdentifier, process.pid, stateHomeDirectory);
   assert.equal(
     await findActiveSession(firstRecord.sessionId, { projectId: projectIdentifier }, stateHomeDirectory),
     undefined,

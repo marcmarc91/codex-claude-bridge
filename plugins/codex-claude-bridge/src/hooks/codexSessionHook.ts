@@ -31,7 +31,7 @@ export async function runCodexSessionHook(input: unknown): Promise<void> {
 
   const projectId = await resolveProjectIdentity(hookInput.cwd);
   if (hookInput.hook_event_name === "SessionEnd") {
-    await unregisterActiveSession(hookInput.session_id, projectId, undefined, process.ppid);
+    await unregisterActiveSession(hookInput.session_id, projectId, process.ppid);
     return;
   }
 

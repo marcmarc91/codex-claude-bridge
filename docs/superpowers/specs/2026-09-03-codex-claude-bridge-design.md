@@ -68,8 +68,11 @@ codex-claude-bridge/
     skills/codex-claude-bridge/SKILL.md
     src/channel/claudeChannelServer.ts
     src/channel/channelSocketServer.ts
+    src/bin/codexClaudeBridge.ts
+    src/bin/claudeCodeBridgeWrapper.ts
     src/cli/main.ts
     src/codex/codexQueueClient.ts
+    src/conversations/conversationRoutes.ts
     src/protocol/messageEnvelope.ts
     src/registry/activeSessionRegistry.ts
     src/registry/projectIdentity.ts
@@ -134,9 +137,9 @@ interface AgentAddress {
 }
 ```
 
-Inputs are validated before transport. IDs must be UUIDs, timestamps must be ISO-8601 values, and `content` must contain between 1 and 65,536 UTF-8 bytes. Unknown fields are rejected. A reply retains `conversationId`, generates a new `messageId`, uses `messageType: "reply"`, and reverses the sender and recipient.
+Inputs are validated before transport. IDs must be UUIDs, timestamps must use the canonical 24-character UTC millisecond form emitted by `Date.prototype.toISOString()`, and `content` must contain between 1 and 65,536 UTF-8 bytes. Unknown fields are rejected. A reply retains `conversationId`, generates a new `messageId`, uses `messageType: "reply"`, and reverses the sender and recipient.
 
-The transport acknowledges only that the target runtime accepted the message. It does not claim that the model processed it. Model replies are separate messages.
+The transport acknowledges only that the target runtime accepted the message. It does not claim that the model processed it. Model replies are separate messages. Active return routes are stored under the user-only bridge state directory by `conversationId`; the CLI and Claude Channel share that single generation-safe store, and remove a route as soon as either endpoint is inactive or its TTL expires.
 
 ## CLI and Tool Interfaces
 
@@ -146,10 +149,12 @@ The global binary is `codex-claude-bridge` and supports:
 codex-claude-bridge sessions [--runtime claude|codex] [--project <path>] [--json]
 codex-claude-bridge send --from <session> --to <session> --type <type> --message <text> [--json]
 codex-claude-bridge reply --conversation <uuid> --message <text> [--json]
-codex-claude-bridge register-codex-hook
-codex-claude-bridge unregister-codex-hook
 codex-claude-bridge doctor [--json]
+codex-claude-bridge install --global
+codex-claude-bridge uninstall --global
 ```
+
+Plugin manifests invoke the internal `codex-session-hook` and `claude-channel` subcommands. Installation and uninstallation own plugin registration; there are no separate public hook-registration commands.
 
 The Claude Channel exposes only:
 
@@ -235,4 +240,4 @@ The live smoke test must demonstrate:
 - Only currently active sessions are addressable.
 - Direct Codex-to-Claude and Claude-to-Codex round trips succeed.
 - Claude-to-Claude traffic remains on native cross-session messaging.
-- No daemon, poller, TCP listener, offline queue, permission relay, credential access, Pinvite dependency, commit, or push is introduced.
+- No daemon, poller, TCP listener, offline queue, permission relay, credential access, Pinvite dependency, Pinvite commit, or push is introduced.

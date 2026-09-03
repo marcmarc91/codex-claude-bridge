@@ -325,9 +325,16 @@ git commit -m "feat: add Claude message channel"
 - Create: `plugins/codex-claude-bridge/src/channel/channelSocketClient.ts`
 - Create: `plugins/codex-claude-bridge/src/conversations/conversationRoutes.ts`
 - Create: `plugins/codex-claude-bridge/src/cli/main.ts`
+- Create: `plugins/codex-claude-bridge/src/bin/codexClaudeBridge.ts`
+- Modify: `plugins/codex-claude-bridge/src/channel/claudeChannelServer.ts`
+- Modify: `plugins/codex-claude-bridge/src/runtime/paths.ts`
+- Modify: `plugins/codex-claude-bridge/hooks/hooks.json`
+- Modify: `plugins/codex-claude-bridge/.mcp.json`
+- Modify: `plugins/codex-claude-bridge/package.json`
 - Create: `plugins/codex-claude-bridge/.codex-plugin/plugin.json`
 - Create: `plugins/codex-claude-bridge/skills/codex-claude-bridge/SKILL.md`
 - Test: `plugins/codex-claude-bridge/tests/channelSocketClient.test.ts`
+- Test: `plugins/codex-claude-bridge/tests/conversationRoutes.test.ts`
 - Test: `plugins/codex-claude-bridge/tests/commandLine.test.ts`
 
 **Interfaces:**
@@ -335,7 +342,7 @@ git commit -m "feat: add Claude message channel"
 - Consumes: protocol, registry, Channel socket response.
 - Consumes: `queueCodexMessage(options): Promise<void>`.
 - Produces: `deliverClaudeMessage(options): Promise<ChannelDeliveryResponse>`.
-- Produces: commands `sessions`, `send`, `reply`, `doctor`, and internal `codex-session-hook` plus `claude-channel`.
+- Produces: commands `sessions`, `send`, `reply`, and internal `codex-session-hook` plus `claude-channel`.
 
 - [ ] **Step 1: Write failing CLI tests**
 
@@ -343,7 +350,7 @@ Cover JSON and human session lists, same-project default selection, explicit uni
 
 - [ ] **Step 2: Implement Channel client, conversation routes, and CLI**
 
-Store only active conversation return routes under the state directory. Delete expired routes when either endpoint is inactive. CLI output goes to stdout only for requested results and stderr only for actionable failures.
+Use one persistent, generation-safe conversation-route service shared by the CLI and Claude Channel. Index routes globally by the UUID `conversationId`, reject ownership collisions, store the route before transport, and roll it back only if the failed send still owns that generation. Keep only routes whose two endpoints are active, and delete expired routes. CLI output goes to stdout only for requested results and stderr only for actionable failures. The executable entrypoint must match the package `bin` path and the package must expose the documented `bridge` script.
 
 - [ ] **Step 3: Add the Codex manifest and shared skill**
 
@@ -353,14 +360,14 @@ The skill instructs Codex to list sessions before sending, avoid implicit broadc
 
 Run: `pnpm --filter codex-claude-bridge check`
 
-Run: `pnpm --filter codex-claude-bridge test -- channelSocketClient.test.ts commandLine.test.ts`
+Run: `pnpm --filter codex-claude-bridge test -- channelSocketClient.test.ts conversationRoutes.test.ts commandLine.test.ts`
 
 Expected: both commands exit `0`.
 
 - [ ] **Step 5: Commit Task 4**
 
 ```bash
-git add plugins/codex-claude-bridge/src/conversations plugins/codex-claude-bridge/src/cli plugins/codex-claude-bridge/src/channel/channelSocketClient.ts plugins/codex-claude-bridge/.codex-plugin plugins/codex-claude-bridge/skills plugins/codex-claude-bridge/tests
+git add plugins/codex-claude-bridge/src/conversations plugins/codex-claude-bridge/src/cli plugins/codex-claude-bridge/src/bin/codexClaudeBridge.ts plugins/codex-claude-bridge/src/channel/channelSocketClient.ts plugins/codex-claude-bridge/src/channel/claudeChannelServer.ts plugins/codex-claude-bridge/src/runtime/paths.ts plugins/codex-claude-bridge/hooks/hooks.json plugins/codex-claude-bridge/.mcp.json plugins/codex-claude-bridge/package.json plugins/codex-claude-bridge/.codex-plugin plugins/codex-claude-bridge/skills plugins/codex-claude-bridge/tests
 git commit -m "feat: route messages between active agents"
 ```
 
@@ -373,8 +380,12 @@ git commit -m "feat: route messages between active agents"
 - Create: `.agents/plugins/marketplace.json`
 - Create: `.claude-plugin/marketplace.json`
 - Create: `plugins/codex-claude-bridge/src/wrapper/claudeProcessWrapper.ts`
+- Create: `plugins/codex-claude-bridge/src/bin/claudeCodeBridgeWrapper.ts`
 - Create: `plugins/codex-claude-bridge/src/install/globalInstaller.ts`
 - Create: `plugins/codex-claude-bridge/src/install/jsonSettingsEditor.ts`
+- Modify: `plugins/codex-claude-bridge/src/cli/main.ts`
+- Modify: `plugins/codex-claude-bridge/package.json`
+- Modify: `pnpm-lock.yaml`
 - Test: `plugins/codex-claude-bridge/tests/claudeProcessWrapper.test.ts`
 - Test: `plugins/codex-claude-bridge/tests/globalInstaller.test.ts`
 
@@ -407,7 +418,7 @@ Assert install is idempotent, preserves unrelated JSONC settings, configures `cl
 
 - [ ] **Step 4: Implement marketplace manifests and installer**
 
-Use marketplace name `codex-claude-bridge-local` in both manifests. Use `jsonc-parser` edits for VS Code settings. Before mutation, print the exact paths and commands. Store an install receipt under the bridge state directory and make repeated install/uninstall safe.
+Use marketplace name `codex-claude-bridge-local` in both manifests. Add `jsonc-parser` and use its edits for VS Code settings. Before mutation, print the exact paths and commands. Resolve Claude even when it is absent from `PATH`. Store an atomic `0600` install receipt under the bridge state directory, preserve the first prior wrapper value, reject source collisions, roll back partial installs, and make repeated install/uninstall safe. Uninstall restores the prior wrapper only through compare-and-swap semantics and removes the global package link last.
 
 - [ ] **Step 5: Implement doctor checks**
 
@@ -417,7 +428,7 @@ Check Node `>=22`, Codex `>=0.149.0`, Claude `>=2.1.224`, both plugin installati
 
 Run the bundled Codex validator against `plugins/codex-claude-bridge`.
 
-Run the installed Claude binary with `plugin validate plugins/codex-claude-bridge`.
+Run the installed Claude binary with `plugin validate plugins/codex-claude-bridge --strict`.
 
 Expected: both validators exit `0`.
 

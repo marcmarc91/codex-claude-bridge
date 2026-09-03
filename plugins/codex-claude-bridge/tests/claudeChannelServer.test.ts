@@ -13,6 +13,7 @@ import {
   startClaudeChannelServer,
   type ClaudeChannelNotification,
 } from "../src/channel/claudeChannelServer.js";
+import { createConversationRouteStore } from "../src/conversations/conversationRoutes.js";
 import type { AgentMessageEnvelope } from "../src/protocol/messageEnvelope.js";
 import {
   registerActiveSession,
@@ -246,11 +247,19 @@ test("lists active Codex sessions and safely queues an explicitly selected targe
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   await registerCodexSession(stateHomeDirectory);
   const queuedEnvelopes: AgentMessageEnvelope[] = [];
+  const routeInspector = createConversationRouteStore({
+    stateHomeDirectory,
+    currentDate: () => new Date("2026-09-03T13:00:00.000Z"),
+    isAddressActive: async () => true,
+  });
+  let routeObservedBeforeQueue = false;
   const channelServer = createClaudeChannelServer({
     owningSession: owningSession(),
     stateHomeDirectory,
     notificationSender: async () => undefined,
     queueMessage: async ({ envelope }) => {
+      routeObservedBeforeQueue =
+        (await routeInspector.findActive(envelope.conversationId)) !== undefined;
       queuedEnvelopes.push(envelope);
     },
     randomIdentifier: () => "ea7220bc-cd1e-41f0-bf7f-413982f18a9c",
@@ -283,6 +292,7 @@ test("lists active Codex sessions and safely queues an explicitly selected targe
     },
   });
   assert.equal(sendResult.isError, undefined);
+  assert.equal(routeObservedBeforeQueue, true);
   assert.match(sendResult.content[0]!.text as string, /transport acknowledgement/u);
   assert.deepEqual(queuedEnvelopes, [
     {
@@ -367,6 +377,7 @@ test("propagates MCP request cancellation to the Codex queue operation", async (
   await toolCall.catch(() => undefined);
 
   assert.equal(receivedQueueSignal?.aborted, true);
+  await channelServer.close();
 });
 
 test("close aborts and awaits an in-flight Codex queue tool call", async (testContext) => {
@@ -420,7 +431,7 @@ test("close aborts and awaits an in-flight Codex queue tool call", async (testCo
   assert.equal(closeSettledBeforeQueue, false);
 });
 
-test("maps accepted envelopes to Channel notifications and learns an in-memory reply route", async (testContext) => {
+test("maps accepted envelopes to Channel notifications and persists the reply route", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   await registerCodexSession(stateHomeDirectory);
   const notifications: ClaudeChannelNotification[] = [];
@@ -441,6 +452,19 @@ test("maps accepted envelopes to Channel notifications and learns an in-memory r
   const abortController = new AbortController();
 
   await channelServer.deliverEnvelope(inboundEnvelope(), abortController.signal);
+
+  const persistedRoute = await createConversationRouteStore({
+    stateHomeDirectory,
+    currentDate: () => new Date("2026-09-03T13:00:00.000Z"),
+    isAddressActive: async () => true,
+  }).findActive(conversationIdentifier);
+  assert.deepEqual(persistedRoute && {
+    codex: persistedRoute.codex,
+    claude: persistedRoute.claude,
+  }, {
+    codex: inboundEnvelope().sender,
+    claude: inboundEnvelope().recipient,
+  });
 
   assert.deepEqual(notifications, [
     {
@@ -465,7 +489,7 @@ test("maps accepted envelopes to Channel notifications and learns an in-memory r
       content: "done",
     },
   });
-  assert.equal(replyResult.isError, undefined);
+  assert.equal(replyResult.isError, undefined, JSON.stringify(replyResult));
   assert.equal(queuedEnvelopes.length, 1);
   assert.deepEqual(queuedEnvelopes[0], {
     schemaVersion: 1,
@@ -490,6 +514,127 @@ test("maps accepted envelopes to Channel notifications and learns an in-memory r
       projectId: claudeProjectIdentifier,
     },
   });
+});
+
+test("resolves a persisted conversation route from a second Channel instance", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  await registerCodexSession(stateHomeDirectory);
+  const firstChannelServer = createClaudeChannelServer({
+    owningSession: owningSession(),
+    stateHomeDirectory,
+    notificationSender: async () => undefined,
+    queueMessage: async () => undefined,
+    currentDate: () => new Date("2026-09-03T13:00:00.000Z"),
+  });
+  await firstChannelServer.deliverEnvelope(
+    inboundEnvelope(),
+    new AbortController().signal,
+  );
+
+  const queuedConversationIdentifiers: string[] = [];
+  const secondChannelServer = createClaudeChannelServer({
+    owningSession: owningSession(),
+    stateHomeDirectory,
+    notificationSender: async () => undefined,
+    queueMessage: async ({ envelope }) => {
+      queuedConversationIdentifiers.push(envelope.conversationId);
+    },
+    randomIdentifier: () => "ea7220bc-cd1e-41f0-bf7f-413982f18a9c",
+    currentDate: () => new Date("2026-09-03T13:00:00.000Z"),
+  });
+  const client = await connectClient(secondChannelServer.mcpServer, testContext);
+
+  const replyResult = await client.callTool({
+    name: "reply_to_codex",
+    arguments: {
+      conversation_id: conversationIdentifier,
+      content: "persisted reply",
+    },
+  });
+
+  assert.equal(replyResult.isError, undefined, JSON.stringify(replyResult));
+  assert.deepEqual(queuedConversationIdentifiers, [conversationIdentifier]);
+});
+
+test("allows exactly one reply across two Channel instances sharing one route generation", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  await registerCodexSession(stateHomeDirectory);
+  await createConversationRouteStore({
+    stateHomeDirectory,
+    isAddressActive: async () => true,
+  }).reserve(conversationIdentifier, {
+    codex: inboundEnvelope().sender,
+    claude: inboundEnvelope().recipient,
+    codexCanReply: false,
+    claudeCanReply: true,
+  });
+  let queueCount = 0;
+  const createCompetingChannel = () =>
+    createClaudeChannelServer({
+      owningSession: owningSession(),
+      stateHomeDirectory,
+      notificationSender: async () => undefined,
+      queueMessage: async () => {
+        queueCount += 1;
+      },
+    });
+  const firstChannel = createCompetingChannel();
+  const secondChannel = createCompetingChannel();
+  const firstClient = await connectClient(firstChannel.mcpServer, testContext);
+  const secondClient = await connectClient(secondChannel.mcpServer, testContext);
+
+  const replies = await Promise.all([
+    firstClient.callTool({
+      name: "reply_to_codex",
+      arguments: {
+        conversation_id: conversationIdentifier,
+        content: "first competitor",
+      },
+    }),
+    secondClient.callTool({
+      name: "reply_to_codex",
+      arguments: {
+        conversation_id: conversationIdentifier,
+        content: "second competitor",
+      },
+    }),
+  ]);
+
+  assert.equal(replies.filter(({ isError }) => isError === undefined).length, 1);
+  assert.equal(replies.filter(({ isError }) => isError === true).length, 1);
+  assert.equal(queueCount, 1);
+});
+
+test("delivers a one-way inbound envelope without authorizing reply_to_codex", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  await registerCodexSession(stateHomeDirectory);
+  let queueCount = 0;
+  const channelServer = createClaudeChannelServer({
+    owningSession: owningSession(),
+    stateHomeDirectory,
+    notificationSender: async () => undefined,
+    queueMessage: async () => {
+      queueCount += 1;
+    },
+  });
+  const client = await connectClient(channelServer.mcpServer, testContext);
+  const oneWayEnvelope = inboundEnvelope();
+  delete oneWayEnvelope.replyRoute;
+
+  await channelServer.deliverEnvelope(
+    oneWayEnvelope,
+    new AbortController().signal,
+  );
+  const replyResult = await client.callTool({
+    name: "reply_to_codex",
+    arguments: {
+      conversation_id: conversationIdentifier,
+      content: "not authorized",
+    },
+  });
+
+  assert.equal(replyResult.isError, true);
+  assert.equal(queueCount, 0);
 });
 
 test("rejects conflicting senders before notification and never broadcasts replies", async (testContext) => {
@@ -564,7 +709,8 @@ test("rejects conflicting senders before notification and never broadcasts repli
   assert.equal(queueCount, 1);
 });
 
-test("reserves a conversation owner while its first notification is in flight", async () => {
+test("reserves a conversation owner while its first notification is in flight", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
   let releaseFirstNotification: (() => void) | undefined;
   const firstNotificationGate = new Promise<void>((resolve) => {
     releaseFirstNotification = resolve;
@@ -576,6 +722,7 @@ test("reserves a conversation owner while its first notification is in flight", 
   let notificationCount = 0;
   const channelServer = createClaudeChannelServer({
     owningSession: owningSession(),
+    stateHomeDirectory,
     findSession: async (sessionIdentifier) =>
       sessionIdentifier === codexSessionIdentifier
         ? {
@@ -700,6 +847,7 @@ test("prunes an offline conversation owner before accepting a new active sender"
 });
 
 test("serializes an in-flight reply with replacement delivery for the same conversation", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const replacementSessionIdentifier = "ea7220bc-cd1e-41f0-bf7f-413982f18a9c";
   const codexSessionRecord = {
     schemaVersion: 1 as const,
@@ -725,26 +873,38 @@ test("serializes an in-flight reply with replacement delivery for the same conve
     observeFirstLookup = resolveLookup;
   });
   let originalSessionLookupCount = 0;
+  let replacementSessionLookupCount = 0;
+  let blockNextOriginalLookup = false;
+  let originalSessionOffline = false;
   const queuedSessionIdentifiers: string[] = [];
   const channelServer = createClaudeChannelServer({
     owningSession: owningSession(),
+    stateHomeDirectory,
     notificationSender: async () => undefined,
     findSession: async (sessionIdentifier) => {
       if (sessionIdentifier === codexSessionIdentifier) {
         originalSessionLookupCount += 1;
-        if (originalSessionLookupCount === 1) {
+        if (originalSessionOffline) {
+          return undefined;
+        }
+        if (blockNextOriginalLookup) {
+          blockNextOriginalLookup = false;
           observeFirstLookup?.();
           await firstLookupGate;
-          return codexSessionRecord;
         }
-        return undefined;
+        return codexSessionRecord;
       }
-      return sessionIdentifier === replacementSessionIdentifier
-        ? replacementSessionRecord
-        : undefined;
+      if (sessionIdentifier === replacementSessionIdentifier) {
+        replacementSessionLookupCount += 1;
+        return replacementSessionRecord;
+      }
+      return undefined;
     },
     queueMessage: async ({ targetSessionId }) => {
       queuedSessionIdentifiers.push(targetSessionId);
+      if (targetSessionId === codexSessionIdentifier) {
+        originalSessionOffline = true;
+      }
     },
   });
   const client = await connectClient(channelServer.mcpServer, testContext);
@@ -753,6 +913,7 @@ test("serializes an in-flight reply with replacement delivery for the same conve
     inboundEnvelope(),
     new AbortController().signal,
   );
+  blockNextOriginalLookup = true;
   const originalReply = client.callTool({
     name: "reply_to_codex",
     arguments: {
@@ -777,7 +938,9 @@ test("serializes an in-flight reply with replacement delivery for the same conve
     new AbortController().signal,
   );
   await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
-  const lookupsBeforeOriginalReplySettled = originalSessionLookupCount;
+  const replacementLookupsBeforeOriginalReplySettled =
+    replacementSessionLookupCount;
+  const queuesBeforeOriginalReplySettled = queuedSessionIdentifiers.length;
   releaseFirstLookup?.();
   await originalReply;
   await replacementDelivery;
@@ -790,7 +953,9 @@ test("serializes an in-flight reply with replacement delivery for the same conve
     },
   });
 
-  assert.equal(lookupsBeforeOriginalReplySettled, 1);
+  assert.equal(replacementLookupsBeforeOriginalReplySettled, 0);
+  assert.equal(queuesBeforeOriginalReplySettled, 0);
+  assert.ok(originalSessionLookupCount > 0);
   assert.equal(replacementReply.isError, undefined);
   assert.deepEqual(queuedSessionIdentifiers, [
     codexSessionIdentifier,
@@ -798,7 +963,7 @@ test("serializes an in-flight reply with replacement delivery for the same conve
   ]);
 });
 
-test("removes an existing reply route after a failed notification delivery", async (testContext) => {
+test("restores an existing reply route after a failed notification delivery", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   await registerCodexSession(stateHomeDirectory);
   let notificationCount = 0;
@@ -829,11 +994,123 @@ test("removes an existing reply route after a failed notification delivery", asy
     name: "reply_to_codex",
     arguments: { conversation_id: conversationIdentifier, content: "late" },
   });
-  assert.equal(replyResult.isError, true);
-  assert.equal(queueCount, 0);
+  assert.equal(replyResult.isError, undefined);
+  assert.equal(queueCount, 1);
 });
 
-test("refreshes TTL and evicts the least recently used conversation route", async (testContext) => {
+test("restores the prior route after a failed reply queue operation", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  await registerCodexSession(stateHomeDirectory);
+  let queueAttemptCount = 0;
+  const channelServer = createClaudeChannelServer({
+    owningSession: owningSession(),
+    stateHomeDirectory,
+    notificationSender: async () => undefined,
+    queueMessage: async () => {
+      queueAttemptCount += 1;
+      if (queueAttemptCount === 1) {
+        throw new Error("queue failed");
+      }
+    },
+  });
+  const client = await connectClient(channelServer.mcpServer, testContext);
+  await channelServer.deliverEnvelope(
+    inboundEnvelope(),
+    new AbortController().signal,
+  );
+
+  const failedReply = await client.callTool({
+    name: "reply_to_codex",
+    arguments: { conversation_id: conversationIdentifier, content: "first" },
+  });
+  const retriedReply = await client.callTool({
+    name: "reply_to_codex",
+    arguments: { conversation_id: conversationIdentifier, content: "second" },
+  });
+
+  assert.equal(failedReply.isError, true);
+  assert.equal(retriedReply.isError, undefined);
+  assert.equal(queueAttemptCount, 2);
+});
+
+test("reports notification and route rollback failures together", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  const routeStore = createConversationRouteStore({
+    stateHomeDirectory,
+    isAddressActive: async () => true,
+  });
+  routeStore.rollback = async () => {
+    throw new Error("route rollback failed");
+  };
+  const channelServer = createClaudeChannelServer({
+    owningSession: owningSession(),
+    stateHomeDirectory,
+    conversationRouteStore: routeStore,
+    notificationSender: async () => {
+      throw new Error("notification failed");
+    },
+    queueMessage: async () => undefined,
+  });
+
+  await assert.rejects(
+    channelServer.deliverEnvelope(
+      inboundEnvelope(),
+      new AbortController().signal,
+    ),
+    /notification failed.*route rollback failed/u,
+  );
+});
+
+test("reports queue and route rollback failures together for send and reply", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  await registerCodexSession(stateHomeDirectory);
+  const routeStore = createConversationRouteStore({
+    stateHomeDirectory,
+    isAddressActive: async () => true,
+  });
+  await routeStore.reserve(conversationIdentifier, {
+    codex: inboundEnvelope().sender,
+    claude: inboundEnvelope().recipient,
+    codexCanReply: false,
+    claudeCanReply: true,
+  });
+  routeStore.rollback = async () => {
+    throw new Error("route rollback failed");
+  };
+  const channelServer = createClaudeChannelServer({
+    owningSession: owningSession(),
+    stateHomeDirectory,
+    conversationRouteStore: routeStore,
+    notificationSender: async () => undefined,
+    queueMessage: async () => {
+      throw new Error("queue failed");
+    },
+  });
+  const client = await connectClient(channelServer.mcpServer, testContext);
+
+  const sendResult = await client.callTool({
+    name: "send_to_codex",
+    arguments: {
+      session_id: codexSessionIdentifier,
+      message_type: "message",
+      content: "send",
+    },
+  });
+  const replyResult = await client.callTool({
+    name: "reply_to_codex",
+    arguments: {
+      conversation_id: conversationIdentifier,
+      content: "reply",
+    },
+  });
+
+  assert.equal(sendResult.isError, true);
+  assert.match(sendResult.content[0]!.text as string, /queue failed.*route rollback failed/u);
+  assert.equal(replyResult.isError, true);
+  assert.match(replyResult.content[0]!.text as string, /queue failed.*route rollback failed/u);
+});
+
+test("refreshes TTL independently for persistent conversation routes", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   await registerCodexSession(stateHomeDirectory);
   const secondConversationIdentifier = "d2f86dee-55db-4a12-9a98-04bc3df54687";
@@ -843,7 +1120,6 @@ test("refreshes TTL and evicts the least recently used conversation route", asyn
   const channelServer = createClaudeChannelServer({
     owningSession: owningSession(),
     stateHomeDirectory,
-    maximumConversationRoutes: 2,
     conversationRouteTimeToLiveMilliseconds: 100,
     currentDate: () => new Date(currentTimeMilliseconds),
     notificationSender: async () => undefined,
@@ -873,17 +1149,17 @@ test("refreshes TTL and evicts the least recently used conversation route", asyn
     new AbortController().signal,
   );
 
-  const evictedReply = await client.callTool({
+  const secondConversationReply = await client.callTool({
     name: "reply_to_codex",
-    arguments: { conversation_id: secondConversationIdentifier, content: "evicted" },
+    arguments: { conversation_id: secondConversationIdentifier, content: "active" },
   });
-  assert.equal(evictedReply.isError, true);
+  assert.equal(secondConversationReply.isError, undefined);
   const refreshedReply = await client.callTool({
     name: "reply_to_codex",
     arguments: { conversation_id: conversationIdentifier, content: "active" },
   });
   assert.equal(refreshedReply.isError, undefined);
-  assert.equal(queueCount, 1);
+  assert.equal(queueCount, 2);
 
   currentTimeMilliseconds += 101;
   const expiredReply = await client.callTool({
@@ -891,10 +1167,12 @@ test("refreshes TTL and evicts the least recently used conversation route", asyn
     arguments: { conversation_id: conversationIdentifier, content: "expired" },
   });
   assert.equal(expiredReply.isError, true);
-  assert.equal(queueCount, 1);
+  assert.equal(queueCount, 2);
 });
 
 test("closes a blocked MCP transport on abort and waits without a late notification", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  await registerCodexSession(stateHomeDirectory);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client(
     { name: "blocked-channel-client", version: "1.0.0" },
@@ -932,6 +1210,7 @@ test("closes a blocked MCP transport on abort and waits without a late notificat
   };
   const channelServer = createClaudeChannelServer({
     owningSession: owningSession(),
+    stateHomeDirectory,
     queueMessage: async () => undefined,
   });
   await channelServer.mcpServer.connect(serverTransport);
@@ -958,6 +1237,8 @@ test("closes a blocked MCP transport on abort and waits without a late notificat
 });
 
 test("close aborts every active delivery and waits for the MCP notification to settle", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  await registerCodexSession(stateHomeDirectory);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client(
     { name: "close-abort-channel-client", version: "1.0.0" },
@@ -995,6 +1276,7 @@ test("close aborts every active delivery and waits for the MCP notification to s
   };
   const channelServer = createClaudeChannelServer({
     owningSession: owningSession(),
+    stateHomeDirectory,
     queueMessage: async () => undefined,
   });
   await channelServer.mcpServer.connect(serverTransport);

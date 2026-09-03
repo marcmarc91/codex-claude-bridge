@@ -73,16 +73,21 @@ export function resolveSessionRegistryDirectory(
 }
 
 export function resolveConversationDirectory(
-  stateHomeDirectory: string,
-  projectIdentity: string,
-  conversationIdentifier: string,
+  stateHomeDirectory?: string,
 ): string {
-  validateProjectIdentity(projectIdentity);
-  validateConversationIdentifier(conversationIdentifier);
   return resolveContainedDirectory(
     resolveBridgeStateDirectory(stateHomeDirectory),
     "conversations",
-    projectIdentity,
-    conversationIdentifier,
+  );
+}
+
+export function resolveConversationRecordPath(
+  stateHomeDirectory: string | undefined,
+  conversationIdentifier: string,
+): string {
+  validateConversationIdentifier(conversationIdentifier);
+  return resolveContainedDirectory(
+    resolveConversationDirectory(stateHomeDirectory),
+    `${conversationIdentifier}.json`,
   );
 }

@@ -8,6 +8,7 @@
     "claude-code-bridge-wrapper": "dist/bin/claudeCodeBridgeWrapper.js"
   },
   "scripts": {
+    "bridge": "node dist/bin/codexClaudeBridge.js",
     "build": "tsc -p tsconfig.json",
     "check": "tsc --noEmit -p tsconfig.json",
     "test": "tsx --test tests/**/*.test.ts"

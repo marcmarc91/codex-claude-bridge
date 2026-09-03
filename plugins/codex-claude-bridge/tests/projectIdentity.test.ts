@@ -9,6 +9,7 @@ import test from "node:test";
 import {
   resolveBridgeStateDirectory,
   resolveConversationDirectory,
+  resolveConversationRecordPath,
   resolveSessionRegistryDirectory,
 } from "../src/runtime/paths.js";
 import { parseAgentMessageEnvelope } from "../src/protocol/messageEnvelope.js";
@@ -65,7 +66,6 @@ test("directorul non-Git are identitate deterministă", async (testContext) => {
 test("toate directoarele runtime valide rămân structural sub rădăcina de stare selectată", () => {
   const stateRootDirectory = join(tmpdir(), "codex-claude-bridge-state");
   const projectIdentity = "0123456789abcdef01234567";
-  const conversationIdentifier = "5cb1e2fd-5b24-4699-bfea-878e9b147370";
   const bridgeStateDirectory = resolveBridgeStateDirectory(stateRootDirectory);
 
   assertPathIsContained(stateRootDirectory, bridgeStateDirectory);
@@ -75,7 +75,7 @@ test("toate directoarele runtime valide rămân structural sub rădăcina de sta
   );
   assertPathIsContained(
     bridgeStateDirectory,
-    resolveConversationDirectory(stateRootDirectory, projectIdentity, conversationIdentifier),
+    resolveConversationDirectory(stateRootDirectory),
   );
 });
 
@@ -104,8 +104,6 @@ test("acceptă UUID v7 pentru conversații la fel ca envelope-ul protocolului", 
 
   const conversationDirectory = resolveConversationDirectory(
     stateRootDirectory,
-    projectIdentity,
-    uuidVersion7,
   );
 
   assert.equal(parsedEnvelope.conversationId, uuidVersion7);
@@ -120,19 +118,15 @@ test("respinge identificatorii de proiect care pot traversa directoare", () => {
     assert.throws(() =>
       resolveSessionRegistryDirectory(stateRootDirectory, projectIdentity),
     );
-    assert.throws(() =>
-      resolveConversationDirectory(stateRootDirectory, projectIdentity, conversationIdentifier),
-    );
   }
 });
 
 test("respinge identificatorii de conversație care pot traversa directoare", () => {
   const stateRootDirectory = join(tmpdir(), "codex-claude-bridge-state");
-  const projectIdentity = "0123456789abcdef01234567";
 
   for (const conversationIdentifier of ["../escape", "nested/path", "/tmp/escape"]) {
     assert.throws(() =>
-      resolveConversationDirectory(stateRootDirectory, projectIdentity, conversationIdentifier),
+      resolveConversationRecordPath(stateRootDirectory, conversationIdentifier),
     );
   }
 });
@@ -195,13 +189,7 @@ test("respinge toate rădăcinile injectate invalide înainte de I/O", async (te
         "0123456789abcdef01234567",
       ),
     );
-    assert.throws(() =>
-      resolveConversationDirectory(
-        invalidStateHomeDirectory,
-        "0123456789abcdef01234567",
-        "5cb1e2fd-5b24-4699-bfea-878e9b147370",
-      ),
-    );
+    assert.throws(() => resolveConversationDirectory(invalidStateHomeDirectory));
     await assert.rejects(() => prepareSecureBridgeState(invalidStateHomeDirectory));
   }
 

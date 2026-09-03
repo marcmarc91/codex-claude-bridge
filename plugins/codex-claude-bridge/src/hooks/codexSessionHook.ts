@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { pathToFileURL } from "node:url";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
@@ -17,6 +18,8 @@ const codexSessionHookInputSchema = z.object({
   session_id: uuidSchema,
   cwd: z.string().refine((value) => isAbsolute(value) && !value.includes("\0")),
 }).passthrough();
+
+export const maximumCodexSessionHookInputUtf8Bytes = 1_048_576;
 
 function parseCodexSessionHookInput(input: unknown): CodexSessionHookInput | undefined {
   const parsedInput = codexSessionHookInputSchema.safeParse(input);
@@ -47,13 +50,23 @@ export async function runCodexSessionHook(input: unknown): Promise<void> {
   });
 }
 
-async function runFromStandardInput(): Promise<void> {
-  let serializedInput = "";
-  for await (const inputChunk of process.stdin) {
-    serializedInput += inputChunk;
+export async function runCodexSessionHookFromStandardInput(
+  inputStream: AsyncIterable<string | Uint8Array> = process.stdin,
+): Promise<void> {
+  let receivedByteCount = 0;
+  const receivedChunks: Buffer[] = [];
+  for await (const inputChunk of inputStream) {
+    const inputBuffer = Buffer.from(inputChunk);
+    receivedByteCount += inputBuffer.length;
+    if (receivedByteCount > maximumCodexSessionHookInputUtf8Bytes) {
+      return;
+    }
+    receivedChunks.push(inputBuffer);
   }
   try {
-    await runCodexSessionHook(JSON.parse(serializedInput));
+    await runCodexSessionHook(
+      JSON.parse(Buffer.concat(receivedChunks, receivedByteCount).toString("utf8")),
+    );
   } catch (error) {
     if (!(error instanceof SyntaxError)) {
       throw error;
@@ -62,5 +75,5 @@ async function runFromStandardInput(): Promise<void> {
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  await runFromStandardInput();
+  await runCodexSessionHookFromStandardInput();
 }

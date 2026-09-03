@@ -7,7 +7,11 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { runCodexSessionHook } from "../src/hooks/codexSessionHook.js";
+import {
+  maximumCodexSessionHookInputUtf8Bytes,
+  runCodexSessionHook,
+  runCodexSessionHookFromStandardInput,
+} from "../src/hooks/codexSessionHook.js";
 import { listActiveSessions } from "../src/registry/activeSessionRegistry.js";
 import { resolveProjectIdentity } from "../src/registry/projectIdentity.js";
 import { resolveSessionRegistryDirectory } from "../src/runtime/paths.js";
@@ -159,6 +163,22 @@ test("entrypoint-ul compilat execută hook-ul din manifest fără stdout și ign
   assert.equal(invocation.standardOutput, "");
   assert.equal((await listActiveSessions({ runtime: "codex", projectId: await resolveProjectIdentity(workingDirectory) }, stateHomeDirectory))[0]?.sessionId, sessionId);
   assert.equal((await invokeSerializedHookEntry("{", stateHomeDirectory)).exitCode, 0);
+});
+
+test("hook-ul oprește citirea imediat ce stdin depășește limita UTF-8", async () => {
+  let readPastLimit = false;
+  const oversizedInput = {
+    async *[Symbol.asyncIterator]() {
+      yield Buffer.alloc(maximumCodexSessionHookInputUtf8Bytes, 0x20);
+      yield Buffer.from("x");
+      readPastLimit = true;
+      throw new Error("input consumed past the bound");
+    },
+  };
+
+  await runCodexSessionHookFromStandardInput(oversizedInput);
+
+  assert.equal(readPastLimit, false);
 });
 
 test("comanda SessionStart din manifest păstrează semantica reală a PID-ului părinte", async (testContext) => {

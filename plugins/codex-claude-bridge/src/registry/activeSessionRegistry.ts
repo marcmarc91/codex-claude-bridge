@@ -127,6 +127,7 @@ function pathIsContained(parentDirectory: string, candidatePath: string): boolea
 function parseStoredActiveSessionRecord(
   input: unknown,
   stateHomeDirectory?: string,
+  canonicalBridgeStateDirectory?: string,
 ): ActiveSessionRecord | undefined {
   const parsedRecord = activeSessionRecordSchema.safeParse(input);
   if (!parsedRecord.success) {
@@ -138,7 +139,12 @@ function parseStoredActiveSessionRecord(
     !pathIsContained(
       resolveBridgeStateDirectory(stateHomeDirectory),
       parsedRecord.data.socketPath,
-    )
+    ) &&
+    (canonicalBridgeStateDirectory === undefined ||
+      !pathIsContained(
+        canonicalBridgeStateDirectory,
+        parsedRecord.data.socketPath,
+      ))
   ) {
     return undefined;
   }
@@ -270,7 +276,11 @@ async function readActiveSessionRecord(
 
     return {
       exists: true,
-      record: parseStoredActiveSessionRecord(parsedInput, stateHomeDirectory),
+      record: parseStoredActiveSessionRecord(
+        parsedInput,
+        stateHomeDirectory,
+        bridgeStateContext.bridgeStateDirectory,
+      ),
     };
   } catch (error) {
     readFailed = true;

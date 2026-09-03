@@ -6,6 +6,7 @@ import {
 } from "../protocol/messageEnvelope.js";
 
 interface SpawnOptions {
+  detached: true;
   shell: false;
   stdio: ["ignore", "ignore", "pipe"];
 }
@@ -26,6 +27,36 @@ export interface QueueCodexMessageOptions {
 
 const defaultTimeoutMilliseconds = 10_000;
 const maximumCapturedStderrBytes = 4_096;
+const forceKillGraceMilliseconds = 250;
+
+function signalCodexProcessGroup(
+  childProcess: ChildProcess,
+  terminationSignal: NodeJS.Signals,
+): void {
+  if (childProcess.pid === undefined) {
+    throw new Error("codex queue process identifier is unavailable");
+  }
+
+  try {
+    process.kill(-childProcess.pid, terminationSignal);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ESRCH") {
+      return;
+    }
+    throw error;
+  }
+}
+
+function signalDirectChildFallback(
+  childProcess: ChildProcess,
+  terminationSignal: NodeJS.Signals,
+): void {
+  try {
+    childProcess.kill(terminationSignal);
+  } catch {
+    return;
+  }
+}
 
 function validateTimeoutMilliseconds(timeoutMilliseconds: number): number {
   if (
@@ -104,12 +135,16 @@ export async function queueCodexMessage(
 
   await new Promise<void>((resolveQueue, rejectQueue) => {
     let queueSettled = false;
+    let queueTimedOut = false;
+    let childProcessClosed = false;
+    let forceKillAttemptCompleted = false;
+    let forceKillError: Error | undefined;
     let capturedStderrBytes = Buffer.alloc(0);
-    let forceKillTimeout: NodeJS.Timeout | undefined;
     const childProcess = spawnProcess(
       options.codexExecutablePath ?? "codex",
       commandArguments,
       {
+        detached: true,
         shell: false,
         stdio: ["ignore", "ignore", "pipe"],
       },
@@ -126,11 +161,30 @@ export async function queueCodexMessage(
         rejectQueue(error);
       }
     };
+    const settleTimedOutQueue = () => {
+      if (queueTimedOut && childProcessClosed && forceKillAttemptCompleted) {
+        settleQueue(forceKillError ?? new Error("codex queue timed out"));
+      }
+    };
     const queueTimeout = setTimeout(() => {
-      childProcess.kill("SIGTERM");
-      forceKillTimeout = setTimeout(() => childProcess.kill("SIGKILL"), 250);
-      forceKillTimeout.unref();
-      settleQueue(new Error("codex queue timed out"));
+      queueTimedOut = true;
+      try {
+        signalCodexProcessGroup(childProcess, "SIGTERM");
+      } catch {
+        signalDirectChildFallback(childProcess, "SIGTERM");
+      }
+      setTimeout(() => {
+        try {
+          signalCodexProcessGroup(childProcess, "SIGKILL");
+        } catch {
+          forceKillError = new Error(
+            "codex queue timed out and its process group could not be force killed",
+          );
+          signalDirectChildFallback(childProcess, "SIGKILL");
+        }
+        forceKillAttemptCompleted = true;
+        settleTimedOutQueue();
+      }, forceKillGraceMilliseconds);
     }, timeoutMilliseconds);
 
     childProcess.stderr?.on("data", (chunk: Buffer | string) => {
@@ -145,11 +199,16 @@ export async function queueCodexMessage(
       }
     });
     childProcess.once("error", () => {
+      if (queueTimedOut) {
+        return;
+      }
       settleQueue(new Error("codex queue could not be started"));
     });
     childProcess.once("close", (exitCode, terminationSignal) => {
-      if (forceKillTimeout !== undefined) {
-        clearTimeout(forceKillTimeout);
+      childProcessClosed = true;
+      if (queueTimedOut) {
+        settleTimedOutQueue();
+        return;
       }
       if (exitCode === 0) {
         settleQueue();

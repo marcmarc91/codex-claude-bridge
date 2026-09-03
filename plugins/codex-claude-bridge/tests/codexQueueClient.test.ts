@@ -80,6 +80,7 @@ test("passes the exact approved argv with shell disabled and content serialized 
   ]);
   assert.equal(capturedOptions?.shell, false);
   assert.deepEqual(capturedOptions?.stdio, ["ignore", "ignore", "pipe"]);
+  assert.equal(capturedOptions?.detached, true);
   assert.equal(capturedArguments?.some((argument) => argument.includes("--model")), false);
   assert.equal(capturedArguments?.some((argument) => argument.includes("sandbox")), false);
   assert.equal(capturedArguments?.some((argument) => argument.includes("approval")), false);
@@ -119,10 +120,9 @@ test("propagates a non-zero exit with bounded sanitized stderr", async () => {
 });
 
 test("terminates a queue process that exceeds its bounded timeout", async () => {
-  const spawnProcess = (() =>
+  const spawnProcess = ((_command, _commandArguments, options) =>
     spawn(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], {
-      shell: false,
-      stdio: ["ignore", "ignore", "pipe"],
+      ...options,
     })) as typeof spawn;
   const startedAt = Date.now();
 
@@ -140,44 +140,88 @@ test("terminates a queue process that exceeds its bounded timeout", async () => 
   assert.equal(Date.now() - startedAt < 1_000, true);
 });
 
-test("force kills a timed-out queue process that ignores SIGTERM", async () => {
+test("force kills the complete timed-out process group after both processes report readiness", async () => {
   let spawnedProcess: ReturnType<typeof spawn> | undefined;
-  const spawnProcess = (() => {
+  let parentProcessIdentifier: number | undefined;
+  let grandchildProcessIdentifier: number | undefined;
+  let resolveReady: (() => void) | undefined;
+  const ready = new Promise<void>((resolve) => {
+    resolveReady = resolve;
+  });
+  const grandchildProgram = [
+    "process.on('SIGTERM', () => undefined)",
+    "process.send('ready')",
+    "setInterval(() => undefined, 1000)",
+  ].join(";");
+  const parentProgram = [
+    "const { spawn } = require('node:child_process')",
+    "process.on('SIGTERM', () => undefined)",
+    `const grandchild = spawn(process.execPath, ['-e', ${JSON.stringify(grandchildProgram)}], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })`,
+    "grandchild.once('message', () => process.stdout.write(JSON.stringify({ parentPid: process.pid, grandchildPid: grandchild.pid }) + '\\n'))",
+    "setInterval(() => undefined, 1000)",
+  ].join(";");
+  const spawnProcess = ((_command, _commandArguments, options) => {
     spawnedProcess = spawn(
       process.execPath,
-      [
-        "-e",
-        "process.on('SIGTERM', () => undefined); process.stdout.write('ready'); setInterval(() => undefined, 1000)",
-      ],
-      { shell: false, stdio: ["ignore", "ignore", "pipe"] },
+      ["-e", parentProgram],
+      { ...options, stdio: ["ignore", "pipe", "pipe"] },
     );
+    let readinessBytes = "";
+    spawnedProcess.stdout?.on("data", (chunk: Buffer | string) => {
+      readinessBytes += chunk.toString();
+      const newlineIndex = readinessBytes.indexOf("\n");
+      if (newlineIndex < 0) {
+        return;
+      }
+      const readyProcessIdentifiers = JSON.parse(
+        readinessBytes.slice(0, newlineIndex),
+      ) as { parentPid: number; grandchildPid: number };
+      parentProcessIdentifier = readyProcessIdentifiers.parentPid;
+      grandchildProcessIdentifier = readyProcessIdentifiers.grandchildPid;
+      resolveReady?.();
+    });
     return spawnedProcess;
   }) as typeof spawn;
 
-  await assert.rejects(() =>
-    queueCodexMessage({
-      targetSessionId: targetSessionIdentifier,
-      envelope: validEnvelope(),
-      spawnProcess,
-      timeoutMilliseconds: 100,
-    }),
-  );
-
-  assert.notEqual(spawnedProcess, undefined);
-  await new Promise<void>((resolveExit, rejectExit) => {
-    if (spawnedProcess!.exitCode !== null || spawnedProcess!.signalCode !== null) {
-      resolveExit();
-      return;
-    }
-    const exitTimeout = setTimeout(
-      () => rejectExit(new Error("Timed-out child remained active")),
-      1_000,
-    );
-    spawnedProcess!.once("close", () => {
-      clearTimeout(exitTimeout);
-      resolveExit();
-    });
+  const queueResult = queueCodexMessage({
+    targetSessionId: targetSessionIdentifier,
+    envelope: validEnvelope(),
+    spawnProcess,
+    timeoutMilliseconds: 500,
   });
+
+  try {
+    await Promise.race([
+      ready,
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("Process group was not ready")), 400);
+      }),
+    ]);
+    await assert.rejects(queueResult, /timed out/u);
+    assert.equal(spawnedProcess?.signalCode, "SIGKILL");
+    assert.notEqual(parentProcessIdentifier, undefined);
+    assert.notEqual(grandchildProcessIdentifier, undefined);
+    for (const processIdentifier of [
+      parentProcessIdentifier!,
+      grandchildProcessIdentifier!,
+    ]) {
+      assert.throws(
+        () => process.kill(processIdentifier, 0),
+        (error: unknown) =>
+          error instanceof Error && "code" in error && error.code === "ESRCH",
+      );
+    }
+  } finally {
+    if (spawnedProcess?.pid !== undefined) {
+      try {
+        process.kill(-spawnedProcess.pid, "SIGKILL");
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) {
+          throw error;
+        }
+      }
+    }
+  }
 });
 
 test("rejects a target that does not match a Codex recipient", async () => {

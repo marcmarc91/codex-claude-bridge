@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
-import { chmod, lstat, mkdtemp, rm, stat } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  realpath,
+  rm,
+  stat,
+  symlink,
+} from "node:fs/promises";
 import { Socket, connect } from "node:net";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -131,7 +140,11 @@ async function exchangeSocketFrame(
     }, 2_000);
 
     socket.on("data", (chunk: Buffer) => responseChunks.push(chunk));
-    socket.once("error", rejectExchange);
+    socket.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code !== "EPIPE") {
+        rejectExchange(error);
+      }
+    });
     socket.once("close", () => {
       clearTimeout(timeoutHandle);
       try {
@@ -168,6 +181,13 @@ test("accepts one bounded envelope and removes its private socket on close", asy
     await rm(stateHomeDirectory, { recursive: true, force: true });
   });
 
+  const canonicalStateHomeDirectory = await realpath(stateHomeDirectory);
+  assert.equal(
+    server.socketPath.startsWith(
+      join(canonicalStateHomeDirectory, "codex-claude-bridge", "sockets"),
+    ),
+    true,
+  );
   assert.equal((await stat(dirname(server.socketPath))).mode & 0o7777, 0o700);
   assert.equal((await lstat(server.socketPath)).isSocket(), true);
   assert.equal((await lstat(server.socketPath)).mode & 0o7777, 0o600);
@@ -181,21 +201,29 @@ test("accepts one bounded envelope and removes its private socket on close", asy
     delivered: true,
     messageId: validEnvelope().messageId,
   });
-  const maximumContentEnvelope = validEnvelope({
-    messageId: "ea7220bc-cd1e-41f0-bf7f-413982f18a9c",
-    content: "é".repeat(32_768),
-  });
-  const maximumContentFrame = `${JSON.stringify(maximumContentEnvelope)}\n`;
-  assert.equal(Buffer.byteLength(maximumContentEnvelope.content, "utf8"), 65_536);
-  assert.equal(Buffer.byteLength(maximumContentFrame, "utf8") <= 131_072, true);
-  assert.deepEqual(
-    await exchangeSocketFrame(server.socketPath, maximumContentFrame),
-    {
-      delivered: true,
-      messageId: maximumContentEnvelope.messageId,
-    },
-  );
-  assert.deepEqual(deliveredEnvelopes, [validEnvelope(), maximumContentEnvelope]);
+  const maximumContentValues = [
+    "\0".repeat(65_536),
+    "\u0001".repeat(65_536),
+    '"'.repeat(65_536),
+    "\\".repeat(65_536),
+    "\0\u0001\"\\".repeat(16_384),
+  ];
+  for (const maximumContent of maximumContentValues) {
+    const maximumContentEnvelope = validEnvelope({
+      messageId: "ea7220bc-cd1e-41f0-bf7f-413982f18a9c",
+      content: maximumContent,
+    });
+    const maximumContentFrame = `${JSON.stringify(maximumContentEnvelope)}\n`;
+    assert.equal(Buffer.byteLength(maximumContent, "utf8"), 65_536);
+    assert.deepEqual(
+      await exchangeSocketFrame(server.socketPath, maximumContentFrame),
+      {
+        delivered: true,
+        messageId: maximumContentEnvelope.messageId,
+      },
+    );
+  }
+  assert.equal(deliveredEnvelopes.length, 1 + maximumContentValues.length);
 
   await server.close();
   await assert.rejects(() => lstat(server.socketPath), { code: "ENOENT" });
@@ -206,6 +234,43 @@ test("accepts one bounded envelope and removes its private socket on close", asy
       stateHomeDirectory,
     ),
     undefined,
+  );
+});
+
+test("publishes and resolves the socket through a canonicalized state root", async (testContext) => {
+  const canonicalStateHomeDirectory = await createStateHomeDirectory();
+  const aliasParentDirectory = await mkdtemp(join("/tmp", "ccb-channel-alias-"));
+  const configuredStateHomeDirectory = join(aliasParentDirectory, "state");
+  await symlink(canonicalStateHomeDirectory, configuredStateHomeDirectory);
+  const canonicalStateHomePath = await realpath(canonicalStateHomeDirectory);
+  await registerCodexSender(configuredStateHomeDirectory);
+  const server = await startChannelSocketServer({
+    owningSession: owningSession(),
+    stateHomeDirectory: configuredStateHomeDirectory,
+    deliverEnvelope: async () => undefined,
+  });
+  testContext.after(async () => {
+    await server.close();
+    await rm(aliasParentDirectory, { recursive: true, force: true });
+    await rm(canonicalStateHomeDirectory, { recursive: true, force: true });
+  });
+
+  assert.equal(
+    server.socketPath.startsWith(
+      join(canonicalStateHomePath, "codex-claude-bridge", "sockets"),
+    ),
+    true,
+  );
+  assert.equal(server.socketPath.includes(configuredStateHomeDirectory), false);
+  assert.equal(
+    (
+      await findActiveSession(
+        claudeSessionIdentifier,
+        { runtime: "claude", projectId: projectIdentifier },
+        configuredStateHomeDirectory,
+      )
+    )?.socketPath,
+    server.socketPath,
   );
 });
 
@@ -283,6 +348,28 @@ test("preserves an existing socket when a randomized name collides", async (test
   assert.notEqual(firstServer.socketPath, secondServer.socketPath);
 });
 
+test("rejects canonical ASCII and Unicode socket paths beyond macOS sun_path", async (testContext) => {
+  const parentDirectory = await mkdtemp(join("/tmp", "ccb-long-root-"));
+  testContext.after(() => rm(parentDirectory, { recursive: true, force: true }));
+  const longStateHomeDirectories = [
+    join(parentDirectory, "a".repeat(64)),
+    join(parentDirectory, "ț".repeat(32)),
+  ];
+
+  for (const stateHomeDirectory of longStateHomeDirectories) {
+    await mkdir(stateHomeDirectory);
+    await assert.rejects(
+      startChannelSocketServer({
+        owningSession: owningSession(),
+        stateHomeDirectory,
+        randomSocketIdentifier: () => "aaaaaaaaaaaaaaaa",
+        deliverEnvelope: async () => undefined,
+      }),
+      /socket path must not exceed 103 UTF-8 bytes/u,
+    );
+  }
+});
+
 test("rejects malformed, partial, extra, overlong, and wrongly addressed frames", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory();
   await registerCodexSender(stateHomeDirectory);
@@ -303,6 +390,8 @@ test("rejects malformed, partial, extra, overlong, and wrongly addressed frames"
     "{\n",
     JSON.stringify(validEnvelope()),
     `${JSON.stringify(validEnvelope())}\n${JSON.stringify(validEnvelope())}\n`,
+    `${JSON.stringify(validEnvelope())}\n `,
+    `${JSON.stringify(validEnvelope())}\n\n`,
     `${JSON.stringify(
       validEnvelope({
         recipient: {
@@ -321,13 +410,20 @@ test("rejects malformed, partial, extra, overlong, and wrongly addressed frames"
         },
       }),
     )}\n`,
-    Buffer.alloc(131_073, 0x20),
+    Buffer.alloc(397_313, 0x20),
   ];
 
   for (const rejectedFrame of rejectedFrames) {
     const response = await exchangeSocketFrame(server.socketPath, rejectedFrame);
     assert.equal(response.delivered, false);
   }
+  assert.deepEqual(
+    await exchangeSocketFrame(server.socketPath, Buffer.alloc(397_313, 0x20)),
+    {
+      delivered: false,
+      error: "Channel frame exceeds maximum encoded envelope size",
+    },
+  );
   assert.equal(deliveryCount, 0);
 
   const staleSenderResponse = await exchangeSocketFrame(
@@ -351,6 +447,15 @@ test("rejects malformed, partial, extra, overlong, and wrongly addressed frames"
     delivered: false,
     error: "Sender Codex session is not active",
   });
+
+  assert.deepEqual(
+    await exchangeSocketFrame(
+      server.socketPath,
+      `${JSON.stringify(validEnvelope())}\r\n`,
+    ),
+    { delivered: true, messageId: validEnvelope().messageId },
+  );
+  assert.equal(deliveryCount, 1);
 });
 
 test("bounds idle client reads", async (testContext) => {
@@ -395,6 +500,93 @@ test("bounds idle client reads", async (testContext) => {
   });
 });
 
+test("uses one absolute read deadline despite a slow byte stream", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory();
+  const server = await startChannelSocketServer({
+    owningSession: owningSession(),
+    stateHomeDirectory,
+    deliverEnvelope: async () => undefined,
+    readTimeoutMilliseconds: 50,
+    writeTimeoutMilliseconds: 200,
+  });
+  testContext.after(async () => {
+    await server.close();
+    await rm(stateHomeDirectory, { recursive: true, force: true });
+  });
+  const startedAt = Date.now();
+
+  const response = await new Promise<ChannelDeliveryResponse>(
+    (resolveResponse, rejectResponse) => {
+      const socket = connect(server.socketPath);
+      const responseChunks: Buffer[] = [];
+      let sentByteCount = 0;
+      let dripInterval: NodeJS.Timeout | undefined;
+      socket.on("data", (chunk: Buffer) => responseChunks.push(chunk));
+      socket.once("error", (error: NodeJS.ErrnoException) => {
+        if (error.code !== "EPIPE") {
+          rejectResponse(error);
+        }
+      });
+      socket.once("close", () => {
+        if (dripInterval !== undefined) {
+          clearInterval(dripInterval);
+        }
+        try {
+          resolveResponse(
+            JSON.parse(Buffer.concat(responseChunks).toString("utf8")) as ChannelDeliveryResponse,
+          );
+        } catch (error) {
+          rejectResponse(error);
+        }
+      });
+      socket.once("connect", () => {
+        dripInterval = setInterval(() => {
+          sentByteCount += 1;
+          socket.write(" ");
+          if (sentByteCount === 8) {
+            clearInterval(dripInterval);
+            dripInterval = undefined;
+            socket.end();
+          }
+        }, 20);
+      });
+    },
+  );
+
+  assert.deepEqual(response, {
+    delivered: false,
+    error: "Channel read timed out",
+  });
+  assert.equal(Date.now() - startedAt < 120, true);
+});
+
+test("clears the read deadline at EOF before bounded processing", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory();
+  await registerCodexSender(stateHomeDirectory);
+  const server = await startChannelSocketServer({
+    owningSession: owningSession(),
+    stateHomeDirectory,
+    deliverEnvelope: async () => {
+      await new Promise<void>((resolveDelivery) => setTimeout(resolveDelivery, 60));
+    },
+    readTimeoutMilliseconds: 20,
+    processingTimeoutMilliseconds: 200,
+    writeTimeoutMilliseconds: 200,
+  });
+  testContext.after(async () => {
+    await server.close();
+    await rm(stateHomeDirectory, { recursive: true, force: true });
+  });
+
+  assert.deepEqual(
+    await exchangeSocketFrame(
+      server.socketPath,
+      `${JSON.stringify(validEnvelope())}\n`,
+    ),
+    { delivered: true, messageId: validEnvelope().messageId },
+  );
+});
+
 test("bounds concurrent client resource use", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory();
   await registerCodexSender(stateHomeDirectory);
@@ -430,11 +622,30 @@ test("bounds concurrent client resource use", async (testContext) => {
 test("bounds Channel notification delivery", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory();
   await registerCodexSender(stateHomeDirectory);
+  let releaseFirstDelivery: (() => void) | undefined;
+  const firstDeliveryGate = new Promise<void>((resolveDelivery) => {
+    releaseFirstDelivery = resolveDelivery;
+  });
+  let observeFirstAbort: (() => void) | undefined;
+  const firstAbortObserved = new Promise<void>((resolveAbort) => {
+    observeFirstAbort = resolveAbort;
+  });
+  let deliveryCount = 0;
   const server = await startChannelSocketServer({
     owningSession: owningSession(),
     stateHomeDirectory,
-    deliverEnvelope: async () => new Promise<void>(() => undefined),
-    notificationTimeoutMilliseconds: 30,
+    deliverEnvelope: async (_envelope, abortSignal) => {
+      deliveryCount += 1;
+      if (deliveryCount !== 1) {
+        return;
+      }
+      abortSignal.addEventListener("abort", () => observeFirstAbort?.(), {
+        once: true,
+      });
+      await firstDeliveryGate;
+    },
+    maximumConcurrentConnections: 1,
+    processingTimeoutMilliseconds: 30,
     readTimeoutMilliseconds: 200,
     writeTimeoutMilliseconds: 200,
   });
@@ -443,12 +654,87 @@ test("bounds Channel notification delivery", async (testContext) => {
     await rm(stateHomeDirectory, { recursive: true, force: true });
   });
 
-  const notificationResponse = await exchangeSocketFrame(
+  let firstResponseSettled = false;
+  const notificationResponsePromise = exchangeSocketFrame(
     server.socketPath,
     `${JSON.stringify(validEnvelope())}\n`,
   );
+  void notificationResponsePromise.finally(() => {
+    firstResponseSettled = true;
+  });
+  await firstAbortObserved;
+  await new Promise<void>((resolveWait) => setTimeout(resolveWait, 20));
+  const responseBeforeRelease = firstResponseSettled;
+  const capacityResponse = await exchangeSocketFrame(
+    server.socketPath,
+    `${JSON.stringify(validEnvelope())}\n`,
+  );
+  releaseFirstDelivery?.();
+  const notificationResponse = await notificationResponsePromise;
+
+  assert.equal(responseBeforeRelease, false);
+  assert.deepEqual(capacityResponse, {
+    delivered: false,
+    error: "Channel connection capacity exceeded",
+  });
   assert.deepEqual(notificationResponse, {
     delivered: false,
     error: "Channel notification timed out",
   });
+  assert.equal(deliveryCount, 1);
+});
+
+test("aborts active processing before close waits for connection settlement", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory();
+  await registerCodexSender(stateHomeDirectory);
+  let observeDeliveryStart: (() => void) | undefined;
+  const deliveryStarted = new Promise<void>((resolveStart) => {
+    observeDeliveryStart = resolveStart;
+  });
+  let abortObserved = false;
+  const server = await startChannelSocketServer({
+    owningSession: owningSession(),
+    stateHomeDirectory,
+    deliverEnvelope: async (_envelope, abortSignal) => {
+      observeDeliveryStart?.();
+      await new Promise<void>((resolveAbort) => {
+        if (abortSignal.aborted) {
+          abortObserved = true;
+          resolveAbort();
+          return;
+        }
+        abortSignal.addEventListener(
+          "abort",
+          () => {
+            abortObserved = true;
+            resolveAbort();
+          },
+          { once: true },
+        );
+      });
+    },
+    processingTimeoutMilliseconds: 1_000,
+    readTimeoutMilliseconds: 200,
+    writeTimeoutMilliseconds: 100,
+  });
+  const clientSocket = connect(server.socketPath);
+  clientSocket.once("error", () => undefined);
+  testContext.after(async () => {
+    clientSocket.destroy();
+    await server.close();
+    await rm(stateHomeDirectory, { recursive: true, force: true });
+  });
+  await new Promise<void>((resolveConnection) => {
+    clientSocket.once("connect", () => {
+      clientSocket.end(`${JSON.stringify(validEnvelope())}\n`);
+      resolveConnection();
+    });
+  });
+  await deliveryStarted;
+  const closeStartedAt = Date.now();
+
+  await server.close();
+
+  assert.equal(abortObserved, true);
+  assert.equal(Date.now() - closeStartedAt < 200, true);
 });

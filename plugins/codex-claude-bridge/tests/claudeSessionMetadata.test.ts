@@ -8,13 +8,22 @@ import { readOwningClaudeSessionMetadata } from "../src/channel/claudeSessionMet
 
 const owningProcessIdentifier = 43127;
 
-function validMetadata() {
+function representativeClaudeMetadataInput() {
   return {
     pid: owningProcessIdentifier,
     sessionId: "ad65b1c1-7386-4465-80f9-4de0a26bc212",
     name: "bridge-owner",
     cwd: "/private/tmp/bridge-project",
     messagingSocketPath: "/private/tmp/claude-private.sock",
+  };
+}
+
+function expectedOwningMetadata() {
+  return {
+    pid: owningProcessIdentifier,
+    sessionId: "ad65b1c1-7386-4465-80f9-4de0a26bc212",
+    name: "bridge-owner",
+    cwd: "/private/tmp/bridge-project",
   };
 }
 
@@ -33,7 +42,7 @@ test("reads only the exact JSON metadata path for the owning PID", async (testCo
   const sessionsDirectory = join(homeDirectory, ".claude", "sessions");
   await writeFile(
     join(sessionsDirectory, `${owningProcessIdentifier}.json`),
-    JSON.stringify(validMetadata()),
+    JSON.stringify(representativeClaudeMetadataInput()),
     { mode: 0o600 },
   );
   await mkdir(join(sessionsDirectory, `${owningProcessIdentifier}.key`));
@@ -51,7 +60,8 @@ test("reads only the exact JSON metadata path for the owning PID", async (testCo
     await chmod(sessionsDirectory, 0o700);
   }
 
-  assert.deepEqual(metadata, validMetadata());
+  assert.deepEqual(metadata, expectedOwningMetadata());
+  assert.equal(Object.hasOwn(metadata, "messagingSocketPath"), false);
 });
 
 test("rejects mismatched identity and malformed metadata fields", async (testContext) => {
@@ -63,13 +73,11 @@ test("rejects mismatched identity and malformed metadata fields", async (testCon
     `${owningProcessIdentifier}.json`,
   );
   const invalidMetadataRecords = [
-    { ...validMetadata(), pid: owningProcessIdentifier + 1 },
-    { ...validMetadata(), sessionId: "not-a-uuid" },
-    { ...validMetadata(), name: "   " },
-    { ...validMetadata(), name: "name\0suffix" },
-    { ...validMetadata(), cwd: "relative/project" },
-    { ...validMetadata(), messagingSocketPath: "relative/socket" },
-    { ...validMetadata(), extra: true },
+    { ...representativeClaudeMetadataInput(), pid: owningProcessIdentifier + 1 },
+    { ...representativeClaudeMetadataInput(), sessionId: "not-a-uuid" },
+    { ...representativeClaudeMetadataInput(), name: "   " },
+    { ...representativeClaudeMetadataInput(), name: "name\0suffix" },
+    { ...representativeClaudeMetadataInput(), cwd: "relative/project" },
   ];
 
   for (const invalidMetadata of invalidMetadataRecords) {
@@ -90,9 +98,13 @@ test("rejects symlink and non-regular metadata paths", async (testContext) => {
   const sessionsDirectory = join(homeDirectory, ".claude", "sessions");
   const metadataPath = join(sessionsDirectory, `${owningProcessIdentifier}.json`);
   const redirectedMetadataPath = join(homeDirectory, "redirected.json");
-  await writeFile(redirectedMetadataPath, JSON.stringify(validMetadata()), {
+  await writeFile(
+    redirectedMetadataPath,
+    JSON.stringify(representativeClaudeMetadataInput()),
+    {
     mode: 0o600,
-  });
+    },
+  );
   await symlink(redirectedMetadataPath, metadataPath);
 
   await assert.rejects(() =>

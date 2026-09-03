@@ -11,7 +11,6 @@ export interface ClaudeSessionMetadata {
   sessionId: string;
   name: string;
   cwd: string;
-  messagingSocketPath: string;
 }
 
 const absolutePathSchema = z
@@ -29,9 +28,8 @@ const claudeSessionMetadataSchema = z
       .max(256)
       .refine((value) => value.trim().length > 0 && !value.includes("\0")),
     cwd: absolutePathSchema,
-    messagingSocketPath: absolutePathSchema,
   })
-  .strict();
+  .strip();
 
 function validateParentProcessIdentifier(parentProcessIdentifier: number): number {
   return z.number().int().safe().positive().parse(parentProcessIdentifier);

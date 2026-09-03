@@ -44,7 +44,7 @@ export interface StartChannelSocketServerOptions {
   maximumConcurrentConnections?: number;
   readTimeoutMilliseconds?: number;
   writeTimeoutMilliseconds?: number;
-  notificationTimeoutMilliseconds?: number;
+  processingTimeoutMilliseconds?: number;
   randomSocketIdentifier?: () => string;
 }
 
@@ -58,11 +58,16 @@ interface SocketIdentity {
   inodeIdentifier: number;
 }
 
-const maximumTransportFrameBytes = 131_072;
+const maximumProtocolContentUtf8Bytes = 65_536;
+const maximumJsonEscapeBytesPerContentByte = 6;
+const maximumStrictEnvelopeOverheadBytes = 4_096;
+const maximumTransportFrameBytes =
+  maximumProtocolContentUtf8Bytes * maximumJsonEscapeBytesPerContentByte +
+  maximumStrictEnvelopeOverheadBytes;
 const defaultMaximumConcurrentConnections = 16;
 const defaultReadTimeoutMilliseconds = 2_000;
 const defaultWriteTimeoutMilliseconds = 2_000;
-const defaultNotificationTimeoutMilliseconds = 5_000;
+const defaultProcessingTimeoutMilliseconds = 5_000;
 const strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 function validatePositiveInteger(value: number, description: string): number {
@@ -105,25 +110,39 @@ function validateEnvelopeRoute(
   }
 }
 
-async function awaitWithTimeout(
+async function awaitProcessingSettlement(
   operation: (abortSignal: AbortSignal) => Promise<void>,
   timeoutMilliseconds: number,
+  shutdownSignal: AbortSignal,
 ): Promise<void> {
-  const abortController = new AbortController();
-  let timeoutHandle: NodeJS.Timeout | undefined;
-  const timeoutPromise = new Promise<never>((_, rejectTimeout) => {
-    timeoutHandle = setTimeout(() => {
-      abortController.abort();
-      rejectTimeout(new Error("Channel notification timed out"));
-    }, timeoutMilliseconds);
-  });
+  const deadlineAbortController = new AbortController();
+  const processingAbortSignal = AbortSignal.any([
+    shutdownSignal,
+    deadlineAbortController.signal,
+  ]);
+  let processingTimedOut = false;
+  const timeoutHandle = setTimeout(() => {
+    processingTimedOut = true;
+    deadlineAbortController.abort();
+  }, timeoutMilliseconds);
+  let operationError: unknown;
 
   try {
-    await Promise.race([operation(abortController.signal), timeoutPromise]);
+    await operation(processingAbortSignal);
+  } catch (error) {
+    operationError = error;
   } finally {
-    if (timeoutHandle !== undefined) {
-      clearTimeout(timeoutHandle);
-    }
+    clearTimeout(timeoutHandle);
+  }
+
+  if (processingTimedOut) {
+    throw new Error("Channel notification timed out");
+  }
+  if (shutdownSignal.aborted) {
+    throw new Error("Channel server is closing");
+  }
+  if (operationError !== undefined) {
+    throw operationError;
   }
 }
 
@@ -165,12 +184,15 @@ async function parseSingleEnvelopeFrame(
     throw new Error("Channel frame ended before its newline terminator");
   }
 
-  const trailingBytes = receivedBytes.subarray(newlineOffset + 1);
-  if (!/^\s*$/u.test(strictUtf8Decoder.decode(trailingBytes))) {
+  if (receivedBytes.length !== newlineOffset + 1) {
     throw new Error("Channel connection contained more than one envelope");
   }
 
-  const frameBytes = receivedBytes.subarray(0, newlineOffset);
+  const frameEndOffset =
+    newlineOffset > 0 && receivedBytes[newlineOffset - 1] === 0x0d
+      ? newlineOffset - 1
+      : newlineOffset;
+  const frameBytes = receivedBytes.subarray(0, frameEndOffset);
   if (frameBytes.length === 0) {
     throw new Error("Channel envelope is empty");
   }
@@ -258,6 +280,9 @@ async function listenOnRandomSocket(
       socketsDirectory,
       `c-${randomSocketIdentifier}.sock`,
     );
+    if (Buffer.byteLength(socketPath, "utf8") > 103) {
+      throw new Error("Channel socket path must not exceed 103 UTF-8 bytes");
+    }
     const server = createServer({ allowHalfOpen: true });
     let socketWasCreated = false;
     try {
@@ -313,16 +338,17 @@ export async function startChannelSocketServer(
     options.writeTimeoutMilliseconds ?? defaultWriteTimeoutMilliseconds,
     "Write timeout",
   );
-  const notificationTimeoutMilliseconds = validateTimeout(
-    options.notificationTimeoutMilliseconds ??
-      defaultNotificationTimeoutMilliseconds,
-    "Notification timeout",
+  const processingTimeoutMilliseconds = validateTimeout(
+    options.processingTimeoutMilliseconds ?? defaultProcessingTimeoutMilliseconds,
+    "Processing timeout",
   );
   const bridgeStateContext = await prepareSecureBridgeState(
     options.stateHomeDirectory,
   );
+  const canonicalStateHomeDirectory =
+    bridgeStateContext.canonicalStateTrustRootDirectory;
   const socketsDirectory = join(
-    bridgeStateContext.configuredBridgeStateDirectory,
+    bridgeStateContext.bridgeStateDirectory,
     "sockets",
   );
   await ensurePrivateBridgeDirectory(
@@ -342,11 +368,16 @@ export async function startChannelSocketServer(
     registeredAt: new Date().toISOString(),
   };
   const connectedSockets = new Set<Socket>();
+  const inFlightConnectionCompletions = new Set<Promise<void>>();
+  const connectionProcessingAbortControllers = new Set<AbortController>();
   let closing = false;
   let closePromise: Promise<void> | undefined;
 
   const processConnection = async (socket: Socket): Promise<void> => {
-    if (closing || connectedSockets.size >= maximumConcurrentConnections) {
+    if (
+      closing ||
+      inFlightConnectionCompletions.size >= maximumConcurrentConnections
+    ) {
       await writeSingleResponse(
         socket,
         {
@@ -361,19 +392,62 @@ export async function startChannelSocketServer(
     }
 
     connectedSockets.add(socket);
+    const connectionProcessingAbortController = new AbortController();
+    connectionProcessingAbortControllers.add(
+      connectionProcessingAbortController,
+    );
+    let completeConnection: (() => void) | undefined;
+    const connectionCompletion = new Promise<void>((resolveCompletion) => {
+      completeConnection = resolveCompletion;
+    });
+    inFlightConnectionCompletions.add(connectionCompletion);
+    void connectionCompletion.then(() => {
+      inFlightConnectionCompletions.delete(connectionCompletion);
+    });
     const receivedChunks: Buffer[] = [];
     let receivedByteCount = 0;
     let responseStarted = false;
+    let processingStarted = false;
+    let connectionFinished = false;
+    let readDeadline: NodeJS.Timeout | undefined;
+    const clearReadDeadline = () => {
+      if (readDeadline !== undefined) {
+        clearTimeout(readDeadline);
+        readDeadline = undefined;
+      }
+    };
+    const finishConnection = () => {
+      if (connectionFinished) {
+        return;
+      }
+      connectionFinished = true;
+      clearReadDeadline();
+      connectedSockets.delete(socket);
+      connectionProcessingAbortControllers.delete(
+        connectionProcessingAbortController,
+      );
+      completeConnection?.();
+    };
     const respond = async (response: ChannelDeliveryResponse): Promise<void> => {
       if (responseStarted) {
         return;
       }
       responseStarted = true;
-      socket.setTimeout(0);
-      await writeSingleResponse(socket, response, writeTimeoutMilliseconds);
+      clearReadDeadline();
+      try {
+        await writeSingleResponse(socket, response, writeTimeoutMilliseconds);
+      } finally {
+        finishConnection();
+      }
     };
 
-    socket.setTimeout(readTimeoutMilliseconds);
+    readDeadline = setTimeout(() => {
+      readDeadline = undefined;
+      void respond({
+        delivered: false,
+        error: "Channel read timed out",
+      }).catch(() => socket.destroy());
+    }, readTimeoutMilliseconds);
     socket.on("data", (chunk: Buffer) => {
       if (responseStarted) {
         return;
@@ -381,24 +455,21 @@ export async function startChannelSocketServer(
       receivedByteCount += chunk.length;
       if (receivedByteCount > maximumTransportFrameBytes) {
         socket.pause();
+        clearReadDeadline();
         void respond({
           delivered: false,
-          error: "Channel frame exceeds 131072 UTF-8 bytes",
+          error: "Channel frame exceeds maximum encoded envelope size",
         }).catch(() => socket.destroy());
         return;
       }
       receivedChunks.push(chunk);
     });
-    socket.once("timeout", () => {
-      void respond({
-        delivered: false,
-        error: "Channel read timed out",
-      }).catch(() => socket.destroy());
-    });
     socket.once("end", () => {
+      clearReadDeadline();
       if (responseStarted) {
         return;
       }
+      processingStarted = true;
       void (async () => {
         try {
           const envelope = await parseSingleEnvelopeFrame(
@@ -408,7 +479,7 @@ export async function startChannelSocketServer(
           if (
             !(await activeSessionRegistrationIsOwned(
               owningRecord,
-              options.stateHomeDirectory,
+              canonicalStateHomeDirectory,
             ))
           ) {
             throw new Error("Channel registration is no longer owned");
@@ -416,23 +487,38 @@ export async function startChannelSocketServer(
           const senderSession = await findActiveSession(
             envelope.sender.sessionId,
             { runtime: "codex", projectId: envelope.sender.projectId },
-            options.stateHomeDirectory,
+            canonicalStateHomeDirectory,
           );
           if (senderSession?.sessionId !== envelope.sender.sessionId) {
             throw new Error("Sender Codex session is not active");
           }
-          await awaitWithTimeout(
+          await awaitProcessingSettlement(
             (abortSignal) => options.deliverEnvelope(envelope, abortSignal),
-            notificationTimeoutMilliseconds,
+            processingTimeoutMilliseconds,
+            connectionProcessingAbortController.signal,
           );
           await respond({ delivered: true, messageId: envelope.messageId });
         } catch (error) {
           await respond(errorResponse(error));
         }
-      })().catch(() => socket.destroy());
+      })().catch(() => {
+        socket.destroy();
+        finishConnection();
+      });
     });
-    socket.once("close", () => connectedSockets.delete(socket));
-    socket.once("error", () => socket.destroy());
+    socket.once("close", () => {
+      clearReadDeadline();
+      if (!processingStarted && !responseStarted) {
+        finishConnection();
+      }
+    });
+    socket.once("error", () => {
+      clearReadDeadline();
+      socket.destroy();
+      if (!processingStarted && !responseStarted) {
+        finishConnection();
+      }
+    });
   };
 
   listeningSocket.server.on("connection", (socket) => {
@@ -440,7 +526,7 @@ export async function startChannelSocketServer(
   });
 
   try {
-    await registerActiveSession(owningRecord, options.stateHomeDirectory);
+    await registerActiveSession(owningRecord, canonicalStateHomeDirectory);
   } catch (error) {
     await closeListeningServer(listeningSocket.server).catch(() => undefined);
     await removeOwnedSocket(
@@ -459,11 +545,18 @@ export async function startChannelSocketServer(
       }
       closing = true;
       closePromise = (async () => {
+        const stopAcceptingConnections = closeListeningServer(
+          listeningSocket.server,
+        );
+        for (const connectionProcessingAbortController of connectionProcessingAbortControllers) {
+          connectionProcessingAbortController.abort();
+        }
         for (const socket of connectedSockets) {
           socket.destroy();
         }
+        await Promise.allSettled([...inFlightConnectionCompletions]);
         const cleanupResults = await Promise.allSettled([
-          closeListeningServer(listeningSocket.server),
+          stopAcceptingConnections,
           removeOwnedSocket(
             bridgeStateContext,
             listeningSocket.socketPath,
@@ -471,7 +564,7 @@ export async function startChannelSocketServer(
           ),
           unregisterActiveSessionGeneration(
             owningRecord,
-            options.stateHomeDirectory,
+            canonicalStateHomeDirectory,
           ),
         ]);
         const cleanupErrors = cleanupResults

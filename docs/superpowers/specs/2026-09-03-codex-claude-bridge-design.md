@@ -56,26 +56,30 @@ There is no shared server. Every active Claude Channel process creates its own U
 
 ```text
 codex-claude-bridge/
-  .claude-plugin/plugin.json
-  .codex-plugin/plugin.json
-  hooks/hooks.json
-  skills/codex-claude-bridge/SKILL.md
-  src/channel/claudeChannelServer.ts
-  src/channel/channelSocketServer.ts
-  src/cli/commandLine.ts
-  src/cli/main.ts
-  src/codex/codexQueueClient.ts
-  src/protocol/messageEnvelope.ts
-  src/registry/activeSessionRegistry.ts
-  src/registry/projectIdentity.ts
-  src/runtime/filePermissions.ts
-  src/runtime/paths.ts
-  src/hooks/codexSessionHook.ts
-  src/wrapper/claudeProcessWrapper.ts
-  tests/
+  .agents/plugins/marketplace.json
+  .claude-plugin/marketplace.json
   package.json
-  tsconfig.json
-  README.md
+  pnpm-workspace.yaml
+  plugins/codex-claude-bridge/
+    .claude-plugin/plugin.json
+    .codex-plugin/plugin.json
+    .mcp.json
+    hooks/hooks.json
+    skills/codex-claude-bridge/SKILL.md
+    src/channel/claudeChannelServer.ts
+    src/channel/channelSocketServer.ts
+    src/cli/main.ts
+    src/codex/codexQueueClient.ts
+    src/protocol/messageEnvelope.ts
+    src/registry/activeSessionRegistry.ts
+    src/registry/projectIdentity.ts
+    src/runtime/paths.ts
+    src/hooks/codexSessionHook.ts
+    src/wrapper/claudeProcessWrapper.ts
+    tests/
+    package.json
+    tsconfig.json
+    README.md
 ```
 
 Each file has one responsibility. The Claude plugin and Codex plugin manifests point to the same compiled package rather than duplicating runtime logic.
@@ -159,10 +163,10 @@ It does not expose a permission tool. The Codex skill uses the CLI for listing, 
 
 ## Claude Integration
 
-The repository is installed as a local Claude plugin containing the MCP Channel configuration. Because custom Channels are in research preview, Claude must start with:
+The repository is added as a local Claude marketplace and its plugin supplies the MCP Channel configuration. Because custom Channels are in research preview, Claude must start with:
 
 ```text
---dangerously-load-development-channels plugin:codex-claude-bridge@local
+--dangerously-load-development-channels plugin:codex-claude-bridge@codex-claude-bridge-local
 ```
 
 A global process wrapper receives the bundled Claude executable path and original arguments, adds this exact Channel flag once, and replaces itself with the real executable. The VS Code machine-level `claudeCode.claudeProcessWrapper` setting points to this wrapper. Existing Claude sessions must be restarted after installation.
@@ -171,7 +175,7 @@ The Channel instructions tell Claude that inbound content comes from another loc
 
 ## Codex Integration
 
-The repository is installed as a global Codex plugin. Its hooks register and unregister sessions, while its skill describes how to select a target and invoke the bridge CLI. Inbound text sent through `codex queue` includes a compact, deterministic prefix identifying it as a bridge message and providing the conversation ID and reply command.
+The repository is added as a local Codex marketplace and installed as a global Codex plugin. Its hooks register and unregister sessions, while its skill describes how to select a target and invoke the bridge CLI. Inbound text sent through `codex queue` includes a compact, deterministic prefix identifying it as a bridge message and providing the conversation ID and reply command.
 
 The bridge never passes `--dangerously-bypass-approvals-and-sandbox`, never changes the target thread's model, and never overrides its active permission profile.
 

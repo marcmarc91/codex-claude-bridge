@@ -4,13 +4,14 @@ import { Buffer } from "node:buffer";
 import { z } from "zod";
 
 export const AgentRuntime = z.enum(["claude", "codex"]);
+export const uuidSchema = z.string().uuid();
 
 export type AgentRuntime = z.infer<typeof AgentRuntime>;
 
 const agentAddressSchema = z
   .object({
     runtime: AgentRuntime,
-    sessionId: z.string().uuid(),
+    sessionId: uuidSchema,
     projectId: z.string().regex(/^[a-f0-9]{24}$/),
   })
   .strict();
@@ -26,8 +27,8 @@ const contentSchema = z
 const agentMessageEnvelopeSchema = z
   .object({
     schemaVersion: z.literal(1),
-    messageId: z.string().uuid(),
-    conversationId: z.string().uuid(),
+    messageId: uuidSchema,
+    conversationId: uuidSchema,
     sentAt: z.string().datetime({ offset: true }),
     messageType: z.enum(["message", "question", "handoff", "reply"]),
     sender: agentAddressSchema,

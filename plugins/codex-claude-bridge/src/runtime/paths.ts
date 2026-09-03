@@ -1,8 +1,9 @@
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
+import { uuidSchema } from "../protocol/messageEnvelope.js";
+
 const projectIdentityPattern = /^[a-f0-9]{24}$/;
-const conversationIdentifierPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function resolveStateHomeDirectory(): string {
   return process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
@@ -31,7 +32,7 @@ function validateProjectIdentity(projectIdentity: string): void {
 }
 
 function validateConversationIdentifier(conversationIdentifier: string): void {
-  if (!conversationIdentifierPattern.test(conversationIdentifier)) {
+  if (!uuidSchema.safeParse(conversationIdentifier).success) {
     throw new TypeError("Conversation identifier must be a UUID");
   }
 }

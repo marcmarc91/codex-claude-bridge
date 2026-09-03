@@ -11,6 +11,7 @@ import {
   resolveConversationDirectory,
   resolveSessionRegistryDirectory,
 } from "../src/runtime/paths.js";
+import { parseAgentMessageEnvelope } from "../src/protocol/messageEnvelope.js";
 import { resolveProjectIdentity } from "../src/registry/projectIdentity.js";
 
 const executeFileAsync = promisify(executeFile);
@@ -75,6 +76,39 @@ test("toate directoarele runtime valide rămân structural sub rădăcina de sta
     bridgeStateDirectory,
     resolveConversationDirectory(stateRootDirectory, projectIdentity, conversationIdentifier),
   );
+});
+
+test("acceptă UUID v7 pentru conversații la fel ca envelope-ul protocolului", () => {
+  const stateRootDirectory = join(tmpdir(), "codex-claude-bridge-state");
+  const projectIdentity = "0123456789abcdef01234567";
+  const uuidVersion7 = "018f1c57-9bd7-7f64-a9d3-9d7c90a3039c";
+  const parsedEnvelope = parseAgentMessageEnvelope({
+    schemaVersion: 1,
+    messageId: "3c4b3c10-21a7-4d6f-b964-3c816b9ed8db",
+    conversationId: uuidVersion7,
+    sentAt: "2026-09-03T12:00:00.000Z",
+    messageType: "message",
+    sender: {
+      runtime: "codex",
+      sessionId: "8d6380bf-1b93-44b3-b3da-a1a661cf8b69",
+      projectId: projectIdentity,
+    },
+    recipient: {
+      runtime: "claude",
+      sessionId: "ad65b1c1-7386-4465-80f9-4de0a26bc212",
+      projectId: projectIdentity,
+    },
+    content: "status?",
+  });
+
+  const conversationDirectory = resolveConversationDirectory(
+    stateRootDirectory,
+    projectIdentity,
+    uuidVersion7,
+  );
+
+  assert.equal(parsedEnvelope.conversationId, uuidVersion7);
+  assertPathIsContained(resolveBridgeStateDirectory(stateRootDirectory), conversationDirectory);
 });
 
 test("respinge identificatorii de proiect care pot traversa directoare", () => {

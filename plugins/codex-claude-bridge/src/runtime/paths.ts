@@ -1,9 +1,10 @@
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { z } from "zod";
 
 import { uuidSchema } from "../protocol/messageEnvelope.js";
 
-const projectIdentityPattern = /^[a-f0-9]{24}$/;
+export const projectIdentitySchema = z.string().regex(/^[a-f0-9]{24}$/);
 
 function resolveStateHomeDirectory(): string {
   return process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
@@ -26,9 +27,7 @@ function resolveContainedDirectory(parentDirectory: string, ...pathSegments: str
 }
 
 function validateProjectIdentity(projectIdentity: string): void {
-  if (!projectIdentityPattern.test(projectIdentity)) {
-    throw new TypeError("Project identity must be a 24-character hexadecimal hash");
-  }
+  projectIdentitySchema.parse(projectIdentity);
 }
 
 function validateConversationIdentifier(conversationIdentifier: string): void {

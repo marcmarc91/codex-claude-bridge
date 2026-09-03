@@ -1,241 +1,77 @@
 import { randomUUID } from "node:crypto";
-import {
-  chmod,
-  mkdir,
-  open,
-  readdir,
-  rename,
-  rm,
-  stat,
-} from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { connect } from "node:net";
+import { chmod, lstat, mkdir, open, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { z } from "zod";
 
-import { resolveBridgeStateDirectory, resolveSessionRegistryDirectory } from "../runtime/paths.js";
+import { AgentRuntime as agentRuntimeSchema, uuidSchema } from "../protocol/messageEnvelope.js";
+import { projectIdentitySchema, resolveBridgeStateDirectory, resolveSessionRegistryDirectory } from "../runtime/paths.js";
 
-export type AgentRuntime = "claude" | "codex";
+export type AgentRuntime = z.infer<typeof agentRuntimeSchema>;
+export interface ActiveSessionRecord { schemaVersion: 1; runtime: AgentRuntime; sessionId: string; displayName: string; processId: number; workingDirectory: string; projectId: string; socketPath?: string; registeredAt: string; }
+export interface ActiveSessionFilters { runtime?: AgentRuntime; projectId?: string; }
 
-export interface ActiveSessionRecord {
-  schemaVersion: 1;
-  runtime: AgentRuntime;
-  sessionId: string;
-  displayName: string;
-  processId: number;
-  workingDirectory: string;
-  projectId: string;
-  socketPath?: string;
-  registeredAt: string;
-}
+const activeSessionRecordSchema = z.object({
+  schemaVersion: z.literal(1), runtime: agentRuntimeSchema, sessionId: uuidSchema, displayName: z.string().min(1),
+  processId: z.number().int().safe().positive(), workingDirectory: z.string().refine((value) => isAbsolute(value) && !value.includes("\0")),
+  projectId: projectIdentitySchema, socketPath: z.string().optional(), registeredAt: z.string().datetime({ offset: true }),
+}).strict().superRefine((record, context) => {
+  if (record.runtime === "claude" && record.socketPath === undefined) context.addIssue({ code: z.ZodIssueCode.custom, message: "Claude sessions require a socket path" });
+  if (record.runtime === "codex" && record.socketPath !== undefined) context.addIssue({ code: z.ZodIssueCode.custom, message: "Codex sessions cannot have a socket path" });
+});
 
-export interface ActiveSessionFilters {
-  runtime?: AgentRuntime;
-  projectId?: string;
-}
+function contained(parent: string, candidate: string): boolean { const child = relative(resolve(parent), resolve(candidate)); return child !== ".." && !child.startsWith(`..${sep}`) && !isAbsolute(child); }
+function registry(stateHome: string | undefined, projectId: string): string { const root = resolveBridgeStateDirectory(stateHome); return resolveSessionRegistryDirectory(dirname(root), projectIdentitySchema.parse(projectId)); }
+function recordPath(directory: string, sessionId: string): string { const path = join(directory, `${uuidSchema.parse(sessionId)}.json`); if (!contained(directory, path)) throw new RangeError("Session record path must remain within its registry directory"); return path; }
+function lockPath(directory: string, sessionId: string): string { const path = join(directory, ".locks", uuidSchema.parse(sessionId)); if (!contained(directory, path)) throw new RangeError("Session lock path must remain within its registry directory"); return path; }
+function parseRecord(input: unknown, stateHome?: string): ActiveSessionRecord | undefined { const parsed = activeSessionRecordSchema.safeParse(input); if (!parsed.success || (parsed.data.socketPath !== undefined && !contained(resolveBridgeStateDirectory(stateHome), parsed.data.socketPath))) return undefined; return parsed.data; }
+async function privateDirectory(path: string): Promise<void> { await mkdir(path, { recursive: true, mode: 0o700 }); await chmod(path, 0o700); }
 
-function getRecordPath(registryDirectory: string, sessionId: string): string {
-  return join(registryDirectory, `${sessionId}.json`);
-}
-
-function resolveRegistryDirectory(
-  stateHomeDirectory: string | undefined,
-  projectId: string,
-): string {
-  return resolveSessionRegistryDirectory(
-    dirname(resolveBridgeStateDirectory(stateHomeDirectory)),
-    projectId,
-  );
-}
-
-function isAgentRuntime(value: unknown): value is AgentRuntime {
-  return value === "claude" || value === "codex";
-}
-
-function parseActiveSessionRecord(value: unknown): ActiveSessionRecord | undefined {
-  if (typeof value !== "object" || value === null) {
-    return undefined;
-  }
-
-  const record = value as Record<string, unknown>;
-  if (
-    record.schemaVersion !== 1 ||
-    !isAgentRuntime(record.runtime) ||
-    typeof record.sessionId !== "string" ||
-    typeof record.displayName !== "string" ||
-    typeof record.processId !== "number" ||
-    !Number.isSafeInteger(record.processId) ||
-    record.processId <= 0 ||
-    typeof record.workingDirectory !== "string" ||
-    typeof record.projectId !== "string" ||
-    typeof record.registeredAt !== "string" ||
-    (record.socketPath !== undefined && typeof record.socketPath !== "string")
-  ) {
-    return undefined;
-  }
-
-  if (record.runtime === "claude" && record.socketPath === undefined) {
-    return undefined;
-  }
-
-  return {
-    schemaVersion: 1,
-    runtime: record.runtime,
-    sessionId: record.sessionId,
-    displayName: record.displayName,
-    processId: record.processId,
-    workingDirectory: record.workingDirectory,
-    projectId: record.projectId,
-    socketPath: record.socketPath,
-    registeredAt: record.registeredAt,
-  };
-}
-
-async function createPrivateDirectory(directory: string): Promise<void> {
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  await chmod(directory, 0o700);
-}
-
-async function isProcessActive(processId: number): Promise<boolean> {
-  try {
-    process.kill(processId, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-async function isSessionActive(record: ActiveSessionRecord): Promise<boolean> {
-  if (!(await isProcessActive(record.processId))) {
-    return false;
-  }
-
-  if (record.runtime !== "claude") {
-    return true;
-  }
-
-  try {
-    await stat(record.socketPath!);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function readActiveSessionRecord(recordPath: string): Promise<ActiveSessionRecord | undefined> {
-  try {
-    const file = await open(recordPath, "r");
+async function withLock<T>(directory: string, sessionId: string, operation: () => Promise<T>): Promise<T> {
+  const directoryPath = lockPath(directory, sessionId); const ownerPath = join(directoryPath, "owner"); const ownerId = randomUUID();
+  await privateDirectory(dirname(directoryPath));
+  for (let attempt = 0; attempt < 50; attempt += 1) {
     try {
-      const content = await file.readFile({ encoding: "utf8" });
-      return parseActiveSessionRecord(JSON.parse(content));
-    } finally {
-      await file.close();
-    }
-  } catch {
-    return undefined;
+      await mkdir(directoryPath, { mode: 0o700 }); await writeFile(ownerPath, ownerId, { mode: 0o600, flag: "wx" });
+      try { return await operation(); } finally { if (await readFile(ownerPath, "utf8").catch(() => "") === ownerId) await rm(directoryPath, { recursive: true, force: true }); }
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; await delay(10); }
   }
+  throw new Error("Timed out waiting for a session mutation lock");
 }
 
-async function listRecordPaths(
-  filters: ActiveSessionFilters,
-  stateHomeDirectory: string | undefined,
-): Promise<string[]> {
-  const sessionsDirectory = join(resolveBridgeStateDirectory(stateHomeDirectory), "sessions");
-  const registryDirectories = filters.projectId === undefined
-    ? await readdir(sessionsDirectory, { withFileTypes: true }).then((entries) =>
-      entries.filter((entry) => entry.isDirectory()).map((entry) => join(sessionsDirectory, entry.name)),
-    ).catch(() => [])
-    : [resolveRegistryDirectory(stateHomeDirectory, filters.projectId)];
+async function processActive(processId: number): Promise<boolean> { try { process.kill(processId, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; } }
+async function socketActive(path: string, stateHome?: string): Promise<boolean> {
+  if (!contained(resolveBridgeStateDirectory(stateHome), path)) return false;
+  try { const status = await lstat(path); if (status.isSymbolicLink() || !status.isSocket()) return false; } catch { return false; }
+  return new Promise((resolveProbe) => { const socket = connect(path); const timer = setTimeout(() => socket.destroy(), 200); const finish = (value: boolean) => { clearTimeout(timer); socket.destroy(); resolveProbe(value); }; socket.once("connect", () => finish(true)); socket.once("error", () => finish(false)); socket.once("close", () => finish(false)); });
+}
+async function active(record: ActiveSessionRecord, stateHome?: string): Promise<boolean> { return (await processActive(record.processId)) && (record.runtime !== "claude" || await socketActive(record.socketPath!, stateHome)); }
+async function readRecord(path: string, stateHome?: string): Promise<ActiveSessionRecord | undefined> { try { return parseRecord(JSON.parse(await readFile(path, "utf8")), stateHome); } catch { return undefined; } }
 
-  const recordPaths = await Promise.all(registryDirectories.map(async (registryDirectory) => {
-    try {
-      const entries = await readdir(registryDirectory, { withFileTypes: true });
-      return entries
-        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
-        .map((entry) => join(registryDirectory, entry.name));
-    } catch {
-      return [];
-    }
-  }));
-  return recordPaths.flat();
+async function cleanInactive(path: string, directory: string, sessionId: string, stateHome?: string): Promise<void> { await withLock(directory, sessionId, async () => { const current = await readRecord(path, stateHome); if (current === undefined || !(await active(current, stateHome))) await unlink(path).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; }); }); }
+async function paths(filters: ActiveSessionFilters, stateHome?: string): Promise<string[]> {
+  const sessions = join(resolveBridgeStateDirectory(stateHome), "sessions");
+  const directories = filters.projectId === undefined ? await readdir(sessions, { withFileTypes: true }).then((entries) => entries.filter((entry) => entry.isDirectory() && projectIdentitySchema.safeParse(entry.name).success).map((entry) => join(sessions, entry.name))).catch(() => []) : [registry(stateHome, filters.projectId)];
+  return (await Promise.all(directories.map(async (directory) => { try { return (await readdir(directory, { withFileTypes: true })).filter((entry) => entry.isFile() && entry.name.endsWith(".json") && uuidSchema.safeParse(entry.name.slice(0, -5)).success).map((entry) => join(directory, entry.name)); } catch { return []; } }))).flat();
 }
 
-export async function registerActiveSession(
-  record: ActiveSessionRecord,
-  stateHomeDirectory?: string,
-): Promise<void> {
-  const parsedRecord = parseActiveSessionRecord(record);
-  if (parsedRecord === undefined) {
-    throw new TypeError("Active session record is invalid");
-  }
-
-  const registryDirectory = resolveRegistryDirectory(stateHomeDirectory, parsedRecord.projectId);
-  await createPrivateDirectory(registryDirectory);
-  const recordPath = getRecordPath(registryDirectory, parsedRecord.sessionId);
-  const temporaryRecordPath = join(registryDirectory, `.${parsedRecord.sessionId}.${randomUUID()}.tmp`);
-  const temporaryRecord = await open(temporaryRecordPath, "wx", 0o600);
-
-  try {
-    await temporaryRecord.writeFile(JSON.stringify(parsedRecord), { encoding: "utf8" });
-  } finally {
-    await temporaryRecord.close();
-  }
-
-  try {
-    await rename(temporaryRecordPath, recordPath);
-    await chmod(recordPath, 0o600);
-  } catch (error) {
-    await rm(temporaryRecordPath, { force: true });
-    throw error;
-  }
+export async function registerActiveSession(record: ActiveSessionRecord, stateHome?: string): Promise<void> {
+  const parsed = parseRecord(record, stateHome); if (parsed === undefined) throw new TypeError("Active session record is invalid");
+  const directory = registry(stateHome, parsed.projectId); await privateDirectory(directory); const path = recordPath(directory, parsed.sessionId);
+  await withLock(directory, parsed.sessionId, async () => { const temporaryPath = join(directory, `.${parsed.sessionId}.${randomUUID()}.tmp`); let file: Awaited<ReturnType<typeof open>> | undefined; try { file = await open(temporaryPath, "wx", 0o600); await file.writeFile(JSON.stringify(parsed), "utf8"); await file.close(); file = undefined; await rename(temporaryPath, path); await chmod(path, 0o600); } catch (error) { if (file !== undefined) await file.close().catch(() => undefined); await rm(temporaryPath, { force: true }).catch(() => undefined); throw error; } });
 }
 
-export async function unregisterActiveSession(
-  sessionId: string,
-  projectId: string,
-  stateHomeDirectory?: string,
-): Promise<void> {
-  const registryDirectory = resolveRegistryDirectory(stateHomeDirectory, projectId);
-  await rm(getRecordPath(registryDirectory, sessionId), { force: true });
+export async function unregisterActiveSession(sessionId: string, projectId: string, stateHome?: string, expectedProcessId?: number): Promise<void> {
+  const directory = registry(stateHome, projectId); const path = recordPath(directory, sessionId);
+  await withLock(directory, sessionId, async () => { const current = await readRecord(path, stateHome); if (current !== undefined && (expectedProcessId === undefined || current.processId === expectedProcessId)) await unlink(path).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; }); });
 }
 
-export async function listActiveSessions(
-  filters: ActiveSessionFilters = {},
-  stateHomeDirectory?: string,
-): Promise<ActiveSessionRecord[]> {
-  const recordPaths = await listRecordPaths(filters, stateHomeDirectory);
-  const records = await Promise.all(recordPaths.map(async (recordPath) => {
-    const record = await readActiveSessionRecord(recordPath);
-    const sessionIsActive = record !== undefined && await isSessionActive(record);
-    if (
-      record === undefined ||
-      (filters.runtime !== undefined && record.runtime !== filters.runtime) ||
-      (filters.projectId !== undefined && record.projectId !== filters.projectId) ||
-      !sessionIsActive
-    ) {
-      if (record === undefined || !sessionIsActive) {
-        await rm(recordPath, { force: true });
-      }
-      return undefined;
-    }
-    return record;
-  }));
-
-  return records.filter((record): record is ActiveSessionRecord => record !== undefined)
-    .sort((firstRecord, secondRecord) => firstRecord.sessionId.localeCompare(secondRecord.sessionId));
+export async function listActiveSessions(filters: ActiveSessionFilters = {}, stateHome?: string): Promise<ActiveSessionRecord[]> {
+  const records = await Promise.all((await paths(filters, stateHome)).map(async (path) => { const sessionId = path.slice(path.lastIndexOf("/") + 1, -5); const current = await readRecord(path, stateHome); if (current === undefined || !(await active(current, stateHome))) { await cleanInactive(path, dirname(path), sessionId, stateHome); return undefined; } if ((filters.runtime !== undefined && current.runtime !== filters.runtime) || (filters.projectId !== undefined && current.projectId !== filters.projectId)) return undefined; return current; }));
+  return records.filter((record): record is ActiveSessionRecord => record !== undefined).sort((first, second) => first.sessionId.localeCompare(second.sessionId));
 }
 
-export async function findActiveSession(
-  identifier: string,
-  filters: ActiveSessionFilters = {},
-  stateHomeDirectory?: string,
-): Promise<ActiveSessionRecord | undefined> {
-  const sessions = await listActiveSessions(filters, stateHomeDirectory);
-  const sessionByIdentifier = sessions.find((session) => session.sessionId === identifier);
-  if (sessionByIdentifier !== undefined) {
-    return sessionByIdentifier;
-  }
-
-  const sessionsByName = sessions.filter((session) => session.displayName === identifier);
-  if (sessionsByName.length > 1) {
-    throw new RangeError("Session display name is ambiguous; use a session ID");
-  }
-  return sessionsByName[0];
+export async function findActiveSession(identifier: string, filters: ActiveSessionFilters = {}, stateHome?: string): Promise<ActiveSessionRecord | undefined> {
+  const sessions = await listActiveSessions(filters, stateHome); const exact = sessions.filter((session) => session.sessionId === identifier); if (exact.length > 1) throw new RangeError("Session ID is not unique; apply more filters"); if (exact.length === 1) return exact[0]; const named = sessions.filter((session) => session.displayName === identifier); if (named.length > 1) throw new RangeError("Session display name is ambiguous; use a session ID"); return named[0];
 }

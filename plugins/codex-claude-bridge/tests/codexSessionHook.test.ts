@@ -1,12 +1,38 @@
 import assert from "node:assert/strict";
+import { execFile, spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import { runCodexSessionHook } from "../src/hooks/codexSessionHook.js";
 import { listActiveSessions } from "../src/registry/activeSessionRegistry.js";
 import { resolveProjectIdentity } from "../src/registry/projectIdentity.js";
+
+const executeFile = promisify(execFile);
+const pluginDirectory = fileURLToPath(new URL("..", import.meta.url));
+
+async function invokeHookEntry(input: object, stateHomeDirectory: string): Promise<{ exitCode: number | null; standardOutput: string }> {
+  return invokeSerializedHookEntry(JSON.stringify(input), stateHomeDirectory);
+}
+
+async function invokeSerializedHookEntry(serializedInput: string, stateHomeDirectory: string): Promise<{ exitCode: number | null; standardOutput: string }> {
+  return new Promise((resolveProcess, rejectProcess) => {
+    const childProcess = spawn(process.execPath, [join(pluginDirectory, "dist/hooks/codexSessionHook.js")], {
+      cwd: pluginDirectory,
+      env: { ...process.env, XDG_STATE_HOME: stateHomeDirectory },
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: false,
+    });
+    let standardOutput = "";
+    childProcess.stdout.on("data", (chunk) => { standardOutput += chunk; });
+    childProcess.once("error", rejectProcess);
+    childProcess.once("close", (exitCode) => resolveProcess({ exitCode, standardOutput }));
+    childProcess.stdin.end(serializedInput);
+  });
+}
 
 test("hook-ul Codex înregistrează și elimină numai sesiunea specificată", async (testContext) => {
   const stateHomeDirectory = await mkdtemp(join(tmpdir(), "codex-claude-bridge-"));
@@ -47,4 +73,17 @@ test("hook-ul Codex înregistrează și elimină numai sesiunea specificată", a
     ),
     [secondSessionIdentifier],
   );
+});
+
+test("entrypoint-ul compilat execută hook-ul din manifest fără stdout și ignoră stdin malformat", async (testContext) => {
+  const stateHomeDirectory = await mkdtemp(join(tmpdir(), "ccb-"));
+  testContext.after(() => rm(stateHomeDirectory, { recursive: true, force: true }));
+  await executeFile(join(pluginDirectory, "node_modules/.bin/tsc"), ["-p", "tsconfig.json"], { cwd: pluginDirectory });
+  const sessionId = "ad65b1c1-7386-4465-80f9-4de0a26bc212";
+  const workingDirectory = process.cwd();
+  const invocation = await invokeHookEntry({ hook_event_name: "SessionStart", session_id: sessionId, cwd: workingDirectory }, stateHomeDirectory);
+  assert.equal(invocation.exitCode, 0);
+  assert.equal(invocation.standardOutput, "");
+  assert.equal((await listActiveSessions({ runtime: "codex", projectId: await resolveProjectIdentity(workingDirectory) }, stateHomeDirectory))[0]?.sessionId, sessionId);
+  assert.equal((await invokeSerializedHookEntry("{", stateHomeDirectory)).exitCode, 0);
 });

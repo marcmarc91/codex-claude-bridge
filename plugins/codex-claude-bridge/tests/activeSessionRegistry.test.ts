@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, stat } from "node:fs/promises";
+import { chmod, mkdtemp, stat } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,6 +12,7 @@ import {
   unregisterActiveSession,
 } from "../src/registry/activeSessionRegistry.js";
 import { resolveSessionRegistryDirectory } from "../src/runtime/paths.js";
+import { resolveBridgeStateDirectory } from "../src/runtime/paths.js";
 
 const projectIdentifier = "0123456789abcdef01234567";
 
@@ -36,13 +38,26 @@ function createRecord(overrides: Partial<{
 }
 
 async function createStateHomeDirectory(testContext: test.TestContext): Promise<string> {
-  const stateHomeDirectory = await mkdtemp(join(tmpdir(), "codex-claude-bridge-"));
+  const stateHomeDirectory = await mkdtemp(join(tmpdir(), "ccb-"));
   testContext.after(async () => {
     await import("node:fs/promises").then(({ rm }) =>
       rm(stateHomeDirectory, { recursive: true, force: true }),
     );
   });
   return stateHomeDirectory;
+}
+
+async function createClaudeSocket(testContext: test.TestContext, stateHomeDirectory: string): Promise<string> {
+  const socketPath = join(resolveBridgeStateDirectory(stateHomeDirectory), "s");
+  const server = createServer();
+  await import("node:fs/promises").then(({ mkdir }) => mkdir(resolveBridgeStateDirectory(stateHomeDirectory), { recursive: true, mode: 0o700 }));
+  await new Promise<void>((resolveServer, rejectServer) => {
+    server.once("error", rejectServer);
+    server.listen(socketPath, resolveServer);
+  });
+  await chmod(socketPath, 0o600);
+  testContext.after(async () => new Promise<void>((resolveServer) => server.close(() => resolveServer())));
+  return socketPath;
 }
 
 test("înregistrează atomic sesiuni și păstrează permisiunile private", async (testContext) => {
@@ -70,9 +85,8 @@ test("filtrează, găsește ID-uri unice și respinge nume ambigue", async (test
     runtime: "claude",
     sessionId: "5cb1e2fd-5b24-4699-bfea-878e9b147370",
     displayName: "working-session",
-    socketPath: join(stateHomeDirectory, "claude.sock"),
+    socketPath: await createClaudeSocket(testContext, stateHomeDirectory),
   });
-  await mkdir(secondRecord.socketPath);
   await registerActiveSession(firstRecord, stateHomeDirectory);
   await registerActiveSession(secondRecord, stateHomeDirectory);
 
@@ -102,7 +116,7 @@ test("elimină procesele moarte și sesiunile Claude fără socket", async (test
     runtime: "claude",
     sessionId: "ad65b1c1-7386-4465-80f9-4de0a26bc212",
     displayName: "claude-session",
-    socketPath: join(stateHomeDirectory, "missing.sock"),
+    socketPath: join(resolveBridgeStateDirectory(stateHomeDirectory), "missing.sock"),
   });
   await registerActiveSession(deadRecord, stateHomeDirectory);
   await registerActiveSession(disconnectedClaudeRecord, stateHomeDirectory);

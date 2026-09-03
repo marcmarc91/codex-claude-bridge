@@ -1,7 +1,10 @@
 import { pathToFileURL } from "node:url";
+import { isAbsolute } from "node:path";
+import { z } from "zod";
 
 import { registerActiveSession, unregisterActiveSession } from "../registry/activeSessionRegistry.js";
 import { resolveProjectIdentity } from "../registry/projectIdentity.js";
+import { uuidSchema } from "../protocol/messageEnvelope.js";
 
 interface CodexSessionHookInput {
   hook_event_name: "SessionStart" | "SessionEnd";
@@ -9,25 +12,15 @@ interface CodexSessionHookInput {
   cwd: string;
 }
 
+const codexSessionHookInputSchema = z.object({
+  hook_event_name: z.enum(["SessionStart", "SessionEnd"]),
+  session_id: uuidSchema,
+  cwd: z.string().refine((value) => isAbsolute(value) && !value.includes("\0")),
+}).passthrough();
+
 function parseCodexSessionHookInput(input: unknown): CodexSessionHookInput | undefined {
-  if (typeof input !== "object" || input === null) {
-    return undefined;
-  }
-
-  const hookInput = input as Record<string, unknown>;
-  if (
-    (hookInput.hook_event_name !== "SessionStart" && hookInput.hook_event_name !== "SessionEnd") ||
-    typeof hookInput.session_id !== "string" ||
-    typeof hookInput.cwd !== "string"
-  ) {
-    return undefined;
-  }
-
-  return {
-    hook_event_name: hookInput.hook_event_name,
-    session_id: hookInput.session_id,
-    cwd: hookInput.cwd,
-  };
+  const parsedInput = codexSessionHookInputSchema.safeParse(input);
+  return parsedInput.success ? parsedInput.data : undefined;
 }
 
 export async function runCodexSessionHook(input: unknown): Promise<void> {
@@ -38,7 +31,7 @@ export async function runCodexSessionHook(input: unknown): Promise<void> {
 
   const projectId = await resolveProjectIdentity(hookInput.cwd);
   if (hookInput.hook_event_name === "SessionEnd") {
-    await unregisterActiveSession(hookInput.session_id, projectId);
+    await unregisterActiveSession(hookInput.session_id, projectId, undefined, process.ppid);
     return;
   }
 
@@ -59,7 +52,13 @@ async function runFromStandardInput(): Promise<void> {
   for await (const inputChunk of process.stdin) {
     serializedInput += inputChunk;
   }
-  await runCodexSessionHook(JSON.parse(serializedInput));
+  try {
+    await runCodexSessionHook(JSON.parse(serializedInput));
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) {
+      throw error;
+    }
+  }
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {

@@ -63,7 +63,6 @@ codex-claude-bridge/
   plugins/codex-claude-bridge/
     .claude-plugin/plugin.json
     .codex-plugin/plugin.json
-    .mcp.json
     hooks/hooks.json
     skills/codex-claude-bridge/SKILL.md
     src/channel/claudeChannelServer.ts
@@ -168,7 +167,7 @@ It does not expose a permission tool. The Codex skill uses the CLI for listing, 
 
 ## Claude Integration
 
-The repository is added as a local Claude marketplace and its plugin supplies the MCP Channel configuration. Because custom Channels are in research preview, Claude must start with:
+The repository is added as a local Claude marketplace and its plugin supplies the MCP Channel configuration inline in `.claude-plugin/plugin.json`. The shared plugin root deliberately has no `.mcp.json`, because Codex auto-discovers that filename as its own MCP component. Because custom Channels are in research preview, Claude must start with:
 
 ```text
 --dangerously-load-development-channels plugin:codex-claude-bridge@codex-claude-bridge-local

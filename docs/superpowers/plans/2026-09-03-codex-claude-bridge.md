@@ -329,7 +329,8 @@ git commit -m "feat: add Claude message channel"
 - Modify: `plugins/codex-claude-bridge/src/channel/claudeChannelServer.ts`
 - Modify: `plugins/codex-claude-bridge/src/runtime/paths.ts`
 - Modify: `plugins/codex-claude-bridge/hooks/hooks.json`
-- Modify: `plugins/codex-claude-bridge/.mcp.json`
+- Modify: `plugins/codex-claude-bridge/.claude-plugin/plugin.json`
+- Delete: `plugins/codex-claude-bridge/.mcp.json`
 - Modify: `plugins/codex-claude-bridge/package.json`
 - Create: `plugins/codex-claude-bridge/.codex-plugin/plugin.json`
 - Create: `plugins/codex-claude-bridge/skills/codex-claude-bridge/SKILL.md`
@@ -350,7 +351,7 @@ Cover JSON and human session lists, same-project default selection, explicit uni
 
 - [ ] **Step 2: Implement Channel client, conversation routes, and CLI**
 
-Use one persistent, generation-safe conversation-route service shared by the CLI and Claude Channel. Index routes globally by the UUID `conversationId`, reject ownership collisions, store the route before transport, and roll it back only if the failed send still owns that generation. Keep only routes whose two endpoints are active, and delete expired routes. CLI output goes to stdout only for requested results and stderr only for actionable failures. The executable entrypoint must match the package `bin` path and the package must expose the documented `bridge` script.
+Use one persistent, generation-safe conversation-route service shared by the CLI and Claude Channel. Index routes globally by the UUID `conversationId`, reject ownership collisions, store the route before transport, and roll it back only if the failed send still owns that generation. Keep only routes whose two endpoints are active, and delete expired routes. CLI output goes to stdout only for requested results and stderr only for actionable failures. The executable entrypoint must match the package `bin` path and the package must expose the documented `bridge` script. Move the Claude MCP server configuration inline into `.claude-plugin/plugin.json` and remove the shared-root `.mcp.json`, so Codex cannot auto-discover and start a Claude-only Channel process.
 
 - [ ] **Step 3: Add the Codex manifest and shared skill**
 
@@ -367,7 +368,7 @@ Expected: both commands exit `0`.
 - [ ] **Step 5: Commit Task 4**
 
 ```bash
-git add plugins/codex-claude-bridge/src/conversations plugins/codex-claude-bridge/src/cli plugins/codex-claude-bridge/src/bin/codexClaudeBridge.ts plugins/codex-claude-bridge/src/channel/channelSocketClient.ts plugins/codex-claude-bridge/src/channel/claudeChannelServer.ts plugins/codex-claude-bridge/src/runtime/paths.ts plugins/codex-claude-bridge/hooks/hooks.json plugins/codex-claude-bridge/.mcp.json plugins/codex-claude-bridge/package.json plugins/codex-claude-bridge/.codex-plugin plugins/codex-claude-bridge/skills plugins/codex-claude-bridge/tests
+git add plugins/codex-claude-bridge/src/conversations plugins/codex-claude-bridge/src/cli plugins/codex-claude-bridge/src/bin/codexClaudeBridge.ts plugins/codex-claude-bridge/src/channel/channelSocketClient.ts plugins/codex-claude-bridge/src/channel/claudeChannelServer.ts plugins/codex-claude-bridge/src/runtime/paths.ts plugins/codex-claude-bridge/hooks/hooks.json plugins/codex-claude-bridge/.claude-plugin/plugin.json plugins/codex-claude-bridge/.mcp.json plugins/codex-claude-bridge/package.json plugins/codex-claude-bridge/.codex-plugin plugins/codex-claude-bridge/skills plugins/codex-claude-bridge/tests
 git commit -m "feat: route messages between active agents"
 ```
 

@@ -43,6 +43,23 @@ export interface ActiveSessionFilters {
   projectId?: string;
 }
 
+function activeSessionRecordsMatch(
+  firstRecord: ActiveSessionRecord,
+  secondRecord: ActiveSessionRecord,
+): boolean {
+  return (
+    firstRecord.schemaVersion === secondRecord.schemaVersion &&
+    firstRecord.runtime === secondRecord.runtime &&
+    firstRecord.sessionId === secondRecord.sessionId &&
+    firstRecord.displayName === secondRecord.displayName &&
+    firstRecord.processId === secondRecord.processId &&
+    firstRecord.workingDirectory === secondRecord.workingDirectory &&
+    firstRecord.projectId === secondRecord.projectId &&
+    firstRecord.socketPath === secondRecord.socketPath &&
+    firstRecord.registeredAt === secondRecord.registeredAt
+  );
+}
+
 interface ActiveSessionRecordReadResult {
   exists: boolean;
   record?: ActiveSessionRecord;
@@ -459,6 +476,71 @@ export async function registerActiveSession(
         recordPath,
         parsedRecord,
       );
+    },
+  );
+}
+
+export async function activeSessionRegistrationIsOwned(
+  expectedRecord: ActiveSessionRecord,
+  stateHomeDirectory?: string,
+): Promise<boolean> {
+  const parsedExpectedRecord = parseRegistrationRecord(
+    expectedRecord,
+    stateHomeDirectory,
+  );
+  const bridgeStateContext = await prepareSecureBridgeState(stateHomeDirectory);
+  const sessionRegistryDirectory = join(
+    bridgeStateContext.bridgeStateDirectory,
+    "sessions",
+    parsedExpectedRecord.projectId,
+  );
+  await ensurePrivateBridgeDirectory(
+    bridgeStateContext,
+    sessionRegistryDirectory,
+    false,
+  );
+  const currentRecord = await readActiveSessionRecord(
+    bridgeStateContext,
+    resolveRecordPath(sessionRegistryDirectory, parsedExpectedRecord.sessionId),
+    stateHomeDirectory,
+  );
+
+  return (
+    currentRecord.record !== undefined &&
+    activeSessionRecordsMatch(currentRecord.record, parsedExpectedRecord) &&
+    (await processIsActive(parsedExpectedRecord.processId))
+  );
+}
+
+export async function unregisterActiveSessionGeneration(
+  expectedRecord: ActiveSessionRecord,
+  stateHomeDirectory?: string,
+): Promise<void> {
+  const parsedExpectedRecord = parseRegistrationRecord(
+    expectedRecord,
+    stateHomeDirectory,
+  );
+
+  await withSessionMutationLock(
+    stateHomeDirectory,
+    parsedExpectedRecord.projectId,
+    parsedExpectedRecord.sessionId,
+    async ({ bridgeStateContext, sessionRegistryDirectory }) => {
+      const recordPath = resolveRecordPath(
+        sessionRegistryDirectory,
+        parsedExpectedRecord.sessionId,
+      );
+      const currentRecord = await readActiveSessionRecord(
+        bridgeStateContext,
+        recordPath,
+        stateHomeDirectory,
+      );
+      if (
+        currentRecord.record !== undefined &&
+        activeSessionRecordsMatch(currentRecord.record, parsedExpectedRecord)
+      ) {
+        await removePrivateRegularFileIfPresent(bridgeStateContext, recordPath);
+      }
     },
   );
 }

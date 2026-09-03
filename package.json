@@ -1,0 +1,11 @@
+{
+  "name": "codex-claude-bridge-workspace",
+  "private": true,
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "build": "pnpm --filter codex-claude-bridge build",
+    "check": "pnpm --filter codex-claude-bridge check",
+    "test": "pnpm --filter codex-claude-bridge test",
+    "verify": "pnpm check && pnpm test && pnpm build"
+  }
+}

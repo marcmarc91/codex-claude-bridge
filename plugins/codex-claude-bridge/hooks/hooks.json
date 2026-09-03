@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "node \"${PLUGIN_ROOT}/dist/hooks/codexSessionHook.js\"",
+        "timeout": 5
+      }
+    ],
+    "SessionEnd": [
+      {
+        "type": "command",
+        "command": "node \"${PLUGIN_ROOT}/dist/hooks/codexSessionHook.js\"",
+        "timeout": 5
+      }
+    ]
+  }
+}

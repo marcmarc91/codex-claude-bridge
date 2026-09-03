@@ -162,7 +162,7 @@ test("declares the Channel capability without permission relay and exposes exact
         description: "Optional absolute project path to filter.",
         minLength: 1,
         maxLength: 4_096,
-        pattern: "^(?!.*\\u0000)/",
+        pattern: "^/[^\\u0000]*$",
       },
     },
     additionalProperties: false,
@@ -207,6 +207,7 @@ test("declares the Channel capability without permission relay and exposes exact
   });
   const projectPattern = tools[0]?.inputSchema.properties?.project?.pattern;
   assert.equal(new RegExp(String(projectPattern)).test("/tmp/project\0nested"), false);
+  assert.equal(new RegExp(String(projectPattern)).test("/segment\n\0tail"), false);
 });
 
 test("rejects relative project filters and enforces UTF-8 content limits at runtime", async (testContext) => {

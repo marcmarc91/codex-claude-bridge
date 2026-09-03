@@ -180,7 +180,7 @@ const channelTools: Tool[] = [
           description: "Optional absolute project path to filter.",
           minLength: 1,
           maxLength: maximumProjectPathCharacters,
-          pattern: "^(?!.*\\u0000)/",
+          pattern: "^/[^\\u0000]*$",
         },
       },
       additionalProperties: false,

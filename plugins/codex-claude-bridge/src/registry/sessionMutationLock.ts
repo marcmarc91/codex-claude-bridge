@@ -15,13 +15,38 @@ export interface SessionMutationContext {
   sessionRegistryDirectory: string;
 }
 
-const lockAcquisitionTimeoutSeconds = 4;
+export interface SessionMutationLockOptions {
+  acquisitionTimeoutSeconds?: number;
+}
 
-async function acquireKernelLock(fileDescriptor: number): Promise<void> {
+const defaultLockAcquisitionTimeoutSeconds = 4;
+
+function resolveLockAcquisitionTimeout(
+  options: SessionMutationLockOptions,
+): number {
+  const requestedTimeoutSeconds =
+    options.acquisitionTimeoutSeconds ?? defaultLockAcquisitionTimeoutSeconds;
+  if (
+    !Number.isInteger(requestedTimeoutSeconds) ||
+    requestedTimeoutSeconds < 0 ||
+    requestedTimeoutSeconds > defaultLockAcquisitionTimeoutSeconds
+  ) {
+    throw new RangeError(
+      `Lock acquisition timeout must be an integer from 0 to ${defaultLockAcquisitionTimeoutSeconds}`,
+    );
+  }
+
+  return requestedTimeoutSeconds;
+}
+
+async function acquireKernelLock(
+  fileDescriptor: number,
+  acquisitionTimeoutSeconds: number,
+): Promise<void> {
   const lockExitCode = await new Promise<number | null>((resolveProcess, rejectProcess) => {
     const lockProcess = spawn(
       "/usr/bin/lockf",
-      ["-s", "-t", String(lockAcquisitionTimeoutSeconds), "3"],
+      ["-s", "-t", String(acquisitionTimeoutSeconds), "3"],
       {
         shell: false,
         stdio: ["ignore", "ignore", "ignore", fileDescriptor],
@@ -32,8 +57,11 @@ async function acquireKernelLock(fileDescriptor: number): Promise<void> {
     lockProcess.once("close", resolveProcess);
   });
 
-  if (lockExitCode !== 0) {
+  if (lockExitCode === 75) {
     throw new Error("Timed out waiting for a session mutation lock");
+  }
+  if (lockExitCode !== 0) {
+    throw new Error(`Unable to acquire the session mutation lock: ${String(lockExitCode)}`);
   }
 }
 
@@ -42,9 +70,11 @@ export async function withSessionMutationLock<T>(
   projectIdentifier: string,
   sessionIdentifier: string,
   operation: (context: SessionMutationContext) => Promise<T>,
+  options: SessionMutationLockOptions = {},
 ): Promise<T> {
   const validatedProjectIdentifier = projectIdentitySchema.parse(projectIdentifier);
   const validatedSessionIdentifier = uuidSchema.parse(sessionIdentifier);
+  const acquisitionTimeoutSeconds = resolveLockAcquisitionTimeout(options);
   const bridgeStateContext = await prepareSecureBridgeState(stateHomeDirectory);
   const sessionsDirectory = join(bridgeStateContext.bridgeStateDirectory, "sessions");
   const sessionRegistryDirectory = join(sessionsDirectory, validatedProjectIdentifier);
@@ -61,7 +91,10 @@ export async function withSessionMutationLock<T>(
   let operationFailed = false;
 
   try {
-    await acquireKernelLock(openedLockFile.fileHandle.fd);
+    await acquireKernelLock(
+      openedLockFile.fileHandle.fd,
+      acquisitionTimeoutSeconds,
+    );
     return await operation({ bridgeStateContext, sessionRegistryDirectory });
   } catch (error) {
     operationFailed = true;

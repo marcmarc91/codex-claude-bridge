@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile as executeFile } from "node:child_process";
 import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -13,6 +13,7 @@ import {
 } from "../src/runtime/paths.js";
 import { parseAgentMessageEnvelope } from "../src/protocol/messageEnvelope.js";
 import { resolveProjectIdentity } from "../src/registry/projectIdentity.js";
+import { prepareSecureBridgeState } from "../src/registry/secureStateFilesystem.js";
 
 const executeFileAsync = promisify(executeFile);
 
@@ -134,4 +135,84 @@ test("respinge identificatorii de conversație care pot traversa directoare", ()
       resolveConversationDirectory(stateRootDirectory, projectIdentity, conversationIdentifier),
     );
   }
+});
+
+test("tratează XDG_STATE_HOME gol ca absent și folosește directorul implicit", (testContext) => {
+  const originalStateHomeDirectory = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = "";
+  testContext.after(() => {
+    if (originalStateHomeDirectory === undefined) {
+      delete process.env.XDG_STATE_HOME;
+    } else {
+      process.env.XDG_STATE_HOME = originalStateHomeDirectory;
+    }
+  });
+
+  assert.equal(
+    resolveBridgeStateDirectory(),
+    join(homedir(), ".local", "state", "codex-claude-bridge"),
+  );
+});
+
+test("respinge valori XDG_STATE_HOME relative, whitespace și cu NUL", (testContext) => {
+  const originalProcessEnvironment = process.env;
+  testContext.after(() => {
+    process.env = originalProcessEnvironment;
+  });
+
+  for (const invalidStateHomeDirectory of [
+    "relative-state",
+    "   ",
+    "/tmp/invalid\0state",
+  ]) {
+    process.env = {
+      ...originalProcessEnvironment,
+      XDG_STATE_HOME: invalidStateHomeDirectory,
+    };
+    assert.throws(() => resolveBridgeStateDirectory());
+  }
+});
+
+test("respinge toate rădăcinile injectate invalide înainte de I/O", async (testContext) => {
+  const temporaryWorkingDirectory = await mkdtemp(join(tmpdir(), "ccb-invalid-root-"));
+  const originalWorkingDirectory = process.cwd();
+  process.chdir(temporaryWorkingDirectory);
+  testContext.after(async () => {
+    process.chdir(originalWorkingDirectory);
+    await rm(temporaryWorkingDirectory, { recursive: true, force: true });
+  });
+
+  for (const invalidStateHomeDirectory of [
+    "",
+    "relative-state",
+    "   ",
+    "/tmp/invalid\0state",
+  ]) {
+    assert.throws(() => resolveBridgeStateDirectory(invalidStateHomeDirectory));
+    assert.throws(() =>
+      resolveSessionRegistryDirectory(
+        invalidStateHomeDirectory,
+        "0123456789abcdef01234567",
+      ),
+    );
+    assert.throws(() =>
+      resolveConversationDirectory(
+        invalidStateHomeDirectory,
+        "0123456789abcdef01234567",
+        "5cb1e2fd-5b24-4699-bfea-878e9b147370",
+      ),
+    );
+    await assert.rejects(() => prepareSecureBridgeState(invalidStateHomeDirectory));
+  }
+
+  assert.deepEqual(await import("node:fs/promises").then(({ readdir }) => readdir(".")), []);
+});
+
+test("păstrează rădăcinile absolute valide injectate", () => {
+  const absoluteStateHomeDirectory = join(tmpdir(), "ccb-valid-state-root");
+
+  assert.equal(
+    resolveBridgeStateDirectory(absoluteStateHomeDirectory),
+    join(absoluteStateHomeDirectory, "codex-claude-bridge"),
+  );
 });

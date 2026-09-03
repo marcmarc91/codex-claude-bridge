@@ -123,6 +123,80 @@ test("concurrent critical sections do not overlap when the first exceeds two sec
   assert.equal(maximumConcurrentCriticalSections, 1);
 });
 
+test("a real lockf timeout is followed by successful reacquisition", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  let resolveFirstAcquisition: (() => void) | undefined;
+  let releaseFirstOperation: (() => void) | undefined;
+  const firstAcquisition = new Promise<void>((resolveAcquisition) => {
+    resolveFirstAcquisition = resolveAcquisition;
+  });
+  const firstOperationRelease = new Promise<void>((resolveRelease) => {
+    releaseFirstOperation = resolveRelease;
+  });
+  testContext.after(() => releaseFirstOperation?.());
+
+  const firstOperation = withSessionMutationLock(
+    stateHomeDirectory,
+    projectIdentifier,
+    sessionIdentifier,
+    async () => {
+      resolveFirstAcquisition?.();
+      await firstOperationRelease;
+    },
+  );
+  await firstAcquisition;
+
+  let timedOutOperationRan = false;
+  const timeoutStartedAt = Date.now();
+  await assert.rejects(
+    withSessionMutationLock(
+      stateHomeDirectory,
+      projectIdentifier,
+      sessionIdentifier,
+      async () => {
+        timedOutOperationRan = true;
+      },
+      { acquisitionTimeoutSeconds: 0 },
+    ),
+    /Timed out waiting for a session mutation lock/,
+  );
+  const timeoutElapsedMilliseconds = Date.now() - timeoutStartedAt;
+
+  releaseFirstOperation?.();
+  await firstOperation;
+
+  let reacquiredOperationRan = false;
+  await withSessionMutationLock(
+    stateHomeDirectory,
+    projectIdentifier,
+    sessionIdentifier,
+    async () => {
+      reacquiredOperationRan = true;
+    },
+    { acquisitionTimeoutSeconds: 0 },
+  );
+
+  assert.equal(timedOutOperationRan, false);
+  assert.ok(timeoutElapsedMilliseconds < 2_000);
+  assert.equal(reacquiredOperationRan, true);
+});
+
+test("injected lockf timeouts remain bounded by the production default", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+
+  for (const acquisitionTimeoutSeconds of [-1, 5, 0.5, Number.NaN]) {
+    await assert.rejects(() =>
+      withSessionMutationLock(
+        stateHomeDirectory,
+        projectIdentifier,
+        sessionIdentifier,
+        async () => undefined,
+        { acquisitionTimeoutSeconds },
+      ),
+    );
+  }
+});
+
 test("a killed lock holder releases the kernel lock for another process", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const fixturePath = fileURLToPath(

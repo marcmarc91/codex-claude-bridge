@@ -102,7 +102,7 @@ test("rejects symlink and non-regular metadata paths", async (testContext) => {
     redirectedMetadataPath,
     JSON.stringify(representativeClaudeMetadataInput()),
     {
-    mode: 0o600,
+      mode: 0o600,
     },
   );
   await symlink(redirectedMetadataPath, metadataPath);

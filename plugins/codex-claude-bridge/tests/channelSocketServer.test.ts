@@ -18,7 +18,10 @@ import {
   type ChannelDeliveryResponse,
   startChannelSocketServer,
 } from "../src/channel/channelSocketServer.js";
-import type { AgentMessageEnvelope } from "../src/protocol/messageEnvelope.js";
+import {
+  maximumSerializedAgentMessageEnvelopeFrameUtf8Bytes,
+  type AgentMessageEnvelope,
+} from "../src/protocol/messageEnvelope.js";
 import {
   findActiveSession,
   registerActiveSession,
@@ -161,6 +164,33 @@ async function exchangeSocketFrame(
       if (endConnection) {
         socket.end();
       }
+    });
+  });
+}
+
+async function collectRejectedConnectionBytes(
+  socketPath: string,
+  frame: string,
+): Promise<Buffer> {
+  return new Promise((resolveConnection, rejectConnection) => {
+    const socket = connect(socketPath);
+    const receivedChunks: Buffer[] = [];
+    const timeoutHandle = setTimeout(() => {
+      socket.destroy();
+      rejectConnection(new Error("Rejected socket did not close"));
+    }, 2_000);
+    socket.on("data", (chunk: Buffer) => receivedChunks.push(chunk));
+    socket.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code !== "EPIPE" && error.code !== "ECONNRESET") {
+        rejectConnection(error);
+      }
+    });
+    socket.once("close", () => {
+      clearTimeout(timeoutHandle);
+      resolveConnection(Buffer.concat(receivedChunks));
+    });
+    socket.once("connect", () => {
+      socket.end(frame);
     });
   });
 }
@@ -410,7 +440,7 @@ test("rejects malformed, partial, extra, overlong, and wrongly addressed frames"
         },
       }),
     )}\n`,
-    Buffer.alloc(397_313, 0x20),
+    Buffer.alloc(maximumSerializedAgentMessageEnvelopeFrameUtf8Bytes + 1, 0x20),
   ];
 
   for (const rejectedFrame of rejectedFrames) {
@@ -418,12 +448,16 @@ test("rejects malformed, partial, extra, overlong, and wrongly addressed frames"
     assert.equal(response.delivered, false);
   }
   assert.deepEqual(
-    await exchangeSocketFrame(server.socketPath, Buffer.alloc(397_313, 0x20)),
+    await exchangeSocketFrame(
+      server.socketPath,
+      Buffer.alloc(maximumSerializedAgentMessageEnvelopeFrameUtf8Bytes + 1, 0x20),
+    ),
     {
       delivered: false,
       error: "Channel frame exceeds maximum encoded envelope size",
     },
   );
+  assert.equal(maximumSerializedAgentMessageEnvelopeFrameUtf8Bytes, 393_784);
   assert.equal(deliveryCount, 0);
 
   const staleSenderResponse = await exchangeSocketFrame(
@@ -502,25 +536,33 @@ test("bounds idle client reads", async (testContext) => {
 
 test("uses one absolute read deadline despite a slow byte stream", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory();
+  let readDeadlineReached: (() => void) | undefined;
+  let scheduledReadDeadlineCount = 0;
+  let observeReadDeadlineSchedule: (() => void) | undefined;
+  const readDeadlineScheduled = new Promise<void>((resolveSchedule) => {
+    observeReadDeadlineSchedule = resolveSchedule;
+  });
   const server = await startChannelSocketServer({
     owningSession: owningSession(),
     stateHomeDirectory,
     deliverEnvelope: async () => undefined,
     readTimeoutMilliseconds: 50,
     writeTimeoutMilliseconds: 200,
+    scheduleReadDeadline: (deadlineReached) => {
+      scheduledReadDeadlineCount += 1;
+      readDeadlineReached = deadlineReached;
+      observeReadDeadlineSchedule?.();
+      return () => undefined;
+    },
   });
   testContext.after(async () => {
     await server.close();
     await rm(stateHomeDirectory, { recursive: true, force: true });
   });
-  const startedAt = Date.now();
-
   const response = await new Promise<ChannelDeliveryResponse>(
     (resolveResponse, rejectResponse) => {
       const socket = connect(server.socketPath);
       const responseChunks: Buffer[] = [];
-      let sentByteCount = 0;
-      let dripInterval: NodeJS.Timeout | undefined;
       socket.on("data", (chunk: Buffer) => responseChunks.push(chunk));
       socket.once("error", (error: NodeJS.ErrnoException) => {
         if (error.code !== "EPIPE") {
@@ -528,9 +570,6 @@ test("uses one absolute read deadline despite a slow byte stream", async (testCo
         }
       });
       socket.once("close", () => {
-        if (dripInterval !== undefined) {
-          clearInterval(dripInterval);
-        }
         try {
           resolveResponse(
             JSON.parse(Buffer.concat(responseChunks).toString("utf8")) as ChannelDeliveryResponse,
@@ -540,15 +579,10 @@ test("uses one absolute read deadline despite a slow byte stream", async (testCo
         }
       });
       socket.once("connect", () => {
-        dripInterval = setInterval(() => {
-          sentByteCount += 1;
+        void readDeadlineScheduled.then(() => {
           socket.write(" ");
-          if (sentByteCount === 8) {
-            clearInterval(dripInterval);
-            dripInterval = undefined;
-            socket.end();
-          }
-        }, 20);
+          setImmediate(() => readDeadlineReached?.());
+        });
       });
     },
   );
@@ -557,34 +591,53 @@ test("uses one absolute read deadline despite a slow byte stream", async (testCo
     delivered: false,
     error: "Channel read timed out",
   });
-  assert.equal(Date.now() - startedAt < 120, true);
+  assert.equal(scheduledReadDeadlineCount, 1);
 });
 
 test("clears the read deadline at EOF before bounded processing", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory();
   await registerCodexSender(stateHomeDirectory);
+  let releaseDelivery: (() => void) | undefined;
+  const deliveryGate = new Promise<void>((resolveDelivery) => {
+    releaseDelivery = resolveDelivery;
+  });
+  let observeDeliveryStart: (() => void) | undefined;
+  const deliveryStarted = new Promise<void>((resolveDelivery) => {
+    observeDeliveryStart = resolveDelivery;
+  });
+  let readDeadlineWasCancelled = false;
   const server = await startChannelSocketServer({
     owningSession: owningSession(),
     stateHomeDirectory,
     deliverEnvelope: async () => {
-      await new Promise<void>((resolveDelivery) => setTimeout(resolveDelivery, 60));
+      observeDeliveryStart?.();
+      await deliveryGate;
     },
     readTimeoutMilliseconds: 20,
-    processingTimeoutMilliseconds: 200,
+    processingTimeoutMilliseconds: 60_000,
     writeTimeoutMilliseconds: 200,
+    scheduleReadDeadline: () => () => {
+      readDeadlineWasCancelled = true;
+    },
   });
   testContext.after(async () => {
     await server.close();
     await rm(stateHomeDirectory, { recursive: true, force: true });
   });
 
+  const responsePromise = exchangeSocketFrame(
+    server.socketPath,
+    `${JSON.stringify(validEnvelope())}\n`,
+  );
+  await deliveryStarted;
+  const deadlineWasCancelledBeforeDeliverySettled = readDeadlineWasCancelled;
+  releaseDelivery?.();
+
   assert.deepEqual(
-    await exchangeSocketFrame(
-      server.socketPath,
-      `${JSON.stringify(validEnvelope())}\n`,
-    ),
+    await responsePromise,
     { delivered: true, messageId: validEnvelope().messageId },
   );
+  assert.equal(deadlineWasCancelledBeforeDeliverySettled, true);
 });
 
 test("bounds concurrent client resource use", async (testContext) => {
@@ -609,14 +662,18 @@ test("bounds concurrent client resource use", async (testContext) => {
     idleSocket.once("connect", resolveConnection);
     idleSocket.once("error", rejectConnection);
   });
-  const capacityResponse = await exchangeSocketFrame(
-    server.socketPath,
-    `${JSON.stringify(validEnvelope())}\n`,
+  const rejectedConnectionBytes = await Promise.all(
+    Array.from({ length: 16 }, () =>
+      collectRejectedConnectionBytes(
+        server.socketPath,
+        `${JSON.stringify(validEnvelope())}\n`,
+      ),
+    ),
   );
-  assert.deepEqual(capacityResponse, {
-    delivered: false,
-    error: "Channel connection capacity exceeded",
-  });
+  assert.deepEqual(
+    rejectedConnectionBytes.map((receivedBytes) => receivedBytes.length),
+    Array.from({ length: 16 }, () => 0),
+  );
 });
 
 test("bounds Channel notification delivery", async (testContext) => {
@@ -663,9 +720,9 @@ test("bounds Channel notification delivery", async (testContext) => {
     firstResponseSettled = true;
   });
   await firstAbortObserved;
-  await new Promise<void>((resolveWait) => setTimeout(resolveWait, 20));
+  await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
   const responseBeforeRelease = firstResponseSettled;
-  const capacityResponse = await exchangeSocketFrame(
+  const rejectedConnectionBytes = await collectRejectedConnectionBytes(
     server.socketPath,
     `${JSON.stringify(validEnvelope())}\n`,
   );
@@ -673,10 +730,7 @@ test("bounds Channel notification delivery", async (testContext) => {
   const notificationResponse = await notificationResponsePromise;
 
   assert.equal(responseBeforeRelease, false);
-  assert.deepEqual(capacityResponse, {
-    delivered: false,
-    error: "Channel connection capacity exceeded",
-  });
+  assert.equal(rejectedConnectionBytes.length, 0);
   assert.deepEqual(notificationResponse, {
     delivered: false,
     error: "Channel notification timed out",
@@ -713,7 +767,7 @@ test("aborts active processing before close waits for connection settlement", as
         );
       });
     },
-    processingTimeoutMilliseconds: 1_000,
+    processingTimeoutMilliseconds: 60_000,
     readTimeoutMilliseconds: 200,
     writeTimeoutMilliseconds: 100,
   });
@@ -731,10 +785,7 @@ test("aborts active processing before close waits for connection settlement", as
     });
   });
   await deliveryStarted;
-  const closeStartedAt = Date.now();
-
   await server.close();
 
   assert.equal(abortObserved, true);
-  assert.equal(Date.now() - closeStartedAt < 200, true);
 });

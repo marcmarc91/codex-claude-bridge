@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { TextDecoder } from "node:util";
 
 import {
+  maximumSerializedAgentMessageEnvelopeFrameUtf8Bytes,
   parseAgentMessageEnvelope,
   type AgentMessageEnvelope,
 } from "../protocol/messageEnvelope.js";
@@ -46,6 +47,10 @@ export interface StartChannelSocketServerOptions {
   writeTimeoutMilliseconds?: number;
   processingTimeoutMilliseconds?: number;
   randomSocketIdentifier?: () => string;
+  scheduleReadDeadline?: (
+    deadlineReached: () => void,
+    timeoutMilliseconds: number,
+  ) => () => void;
 }
 
 export interface ChannelSocketServer {
@@ -58,12 +63,8 @@ interface SocketIdentity {
   inodeIdentifier: number;
 }
 
-const maximumProtocolContentUtf8Bytes = 65_536;
-const maximumJsonEscapeBytesPerContentByte = 6;
-const maximumStrictEnvelopeOverheadBytes = 4_096;
 const maximumTransportFrameBytes =
-  maximumProtocolContentUtf8Bytes * maximumJsonEscapeBytesPerContentByte +
-  maximumStrictEnvelopeOverheadBytes;
+  maximumSerializedAgentMessageEnvelopeFrameUtf8Bytes;
 const defaultMaximumConcurrentConnections = 16;
 const defaultReadTimeoutMilliseconds = 2_000;
 const defaultWriteTimeoutMilliseconds = 2_000;
@@ -342,6 +343,12 @@ export async function startChannelSocketServer(
     options.processingTimeoutMilliseconds ?? defaultProcessingTimeoutMilliseconds,
     "Processing timeout",
   );
+  const scheduleReadDeadline =
+    options.scheduleReadDeadline ??
+    ((deadlineReached: () => void, timeoutMilliseconds: number) => {
+      const timeoutHandle = setTimeout(deadlineReached, timeoutMilliseconds);
+      return () => clearTimeout(timeoutHandle);
+    });
   const bridgeStateContext = await prepareSecureBridgeState(
     options.stateHomeDirectory,
   );
@@ -374,24 +381,6 @@ export async function startChannelSocketServer(
   let closePromise: Promise<void> | undefined;
 
   const processConnection = async (socket: Socket): Promise<void> => {
-    if (
-      closing ||
-      inFlightConnectionCompletions.size >= maximumConcurrentConnections
-    ) {
-      await writeSingleResponse(
-        socket,
-        {
-          delivered: false,
-          error: closing
-            ? "Channel server is closing"
-            : "Channel connection capacity exceeded",
-        },
-        writeTimeoutMilliseconds,
-      ).catch(() => socket.destroy());
-      return;
-    }
-
-    connectedSockets.add(socket);
     const connectionProcessingAbortController = new AbortController();
     connectionProcessingAbortControllers.add(
       connectionProcessingAbortController,
@@ -409,11 +398,11 @@ export async function startChannelSocketServer(
     let responseStarted = false;
     let processingStarted = false;
     let connectionFinished = false;
-    let readDeadline: NodeJS.Timeout | undefined;
+    let cancelReadDeadline: (() => void) | undefined;
     const clearReadDeadline = () => {
-      if (readDeadline !== undefined) {
-        clearTimeout(readDeadline);
-        readDeadline = undefined;
+      if (cancelReadDeadline !== undefined) {
+        cancelReadDeadline();
+        cancelReadDeadline = undefined;
       }
     };
     const finishConnection = () => {
@@ -441,8 +430,8 @@ export async function startChannelSocketServer(
       }
     };
 
-    readDeadline = setTimeout(() => {
-      readDeadline = undefined;
+    cancelReadDeadline = scheduleReadDeadline(() => {
+      cancelReadDeadline = undefined;
       void respond({
         delivered: false,
         error: "Channel read timed out",
@@ -522,6 +511,11 @@ export async function startChannelSocketServer(
   };
 
   listeningSocket.server.on("connection", (socket) => {
+    if (closing || connectedSockets.size >= maximumConcurrentConnections) {
+      socket.destroy();
+      return;
+    }
+    connectedSockets.add(socket);
     void processConnection(socket);
   });
 

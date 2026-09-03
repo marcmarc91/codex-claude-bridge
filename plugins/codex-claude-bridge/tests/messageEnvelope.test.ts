@@ -38,6 +38,18 @@ test("respinge un ID de mesaj care nu este UUID", () => {
   assert.throws(() => parseAgentMessageEnvelope({ ...validEnvelope, messageId: "bad" }));
 });
 
+test("acceptă numai timestamp-uri UTC cu milisecunde în forma toISOString", () => {
+  assert.equal(parseAgentMessageEnvelope(validEnvelope).sentAt, validEnvelope.sentAt);
+  for (const sentAt of [
+    "2026-09-03T12:00:00Z",
+    "2026-09-03T12:00:00.0000Z",
+    "2026-09-03T14:00:00.000+02:00",
+    "2026-09-03t12:00:00.000z",
+  ]) {
+    assert.throws(() => parseAgentMessageEnvelope({ ...validEnvelope, sentAt }));
+  }
+});
+
 test("respinge conținutul gol", () => {
   assert.throws(() => parseAgentMessageEnvelope({ ...validEnvelope, content: "" }));
 });

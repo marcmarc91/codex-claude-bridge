@@ -3,11 +3,11 @@ import { isAbsolute, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  type CallToolRequest,
   type CallToolResult,
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
@@ -41,6 +41,7 @@ import {
   readOwningClaudeSessionMetadata,
   type ClaudeSessionMetadata,
 } from "./claudeSessionMetadata.js";
+import { CancellableStdioServerTransport } from "./cancellableStdioServerTransport.js";
 
 export type ClaudeChannelNotification = {
   method: "notifications/claude/channel";
@@ -179,7 +180,7 @@ const channelTools: Tool[] = [
           description: "Optional absolute project path to filter.",
           minLength: 1,
           maxLength: maximumProjectPathCharacters,
-          pattern: "^/",
+          pattern: "^(?!.*\\u0000)/",
         },
       },
       additionalProperties: false,
@@ -333,7 +334,34 @@ export function createClaudeChannelServer(
         defaultConversationRouteTimeToLiveMilliseconds,
     );
   const activeConversationRoutes = new Map<string, ActiveConversationRoute>();
-  const pendingConversationSenders = new Map<string, AgentAddress>();
+  const conversationOperationTails = new Map<string, Promise<void>>();
+  const runConversationOperation = async <Result>(
+    conversationIdentifier: string,
+    operation: () => Promise<Result>,
+  ): Promise<Result> => {
+    const precedingOperation =
+      conversationOperationTails.get(conversationIdentifier) ?? Promise.resolve();
+    let completeCurrentOperation: (() => void) | undefined;
+    const currentOperationCompletion = new Promise<void>((resolveCompletion) => {
+      completeCurrentOperation = resolveCompletion;
+    });
+    const currentOperationTail = precedingOperation
+      .catch(() => undefined)
+      .then(() => currentOperationCompletion);
+    conversationOperationTails.set(conversationIdentifier, currentOperationTail);
+    await precedingOperation.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      completeCurrentOperation?.();
+      if (
+        conversationOperationTails.get(conversationIdentifier) ===
+        currentOperationTail
+      ) {
+        conversationOperationTails.delete(conversationIdentifier);
+      }
+    }
+  };
   const pruneExpiredConversationRoutes = (currentTimeMilliseconds: number) => {
     for (const [conversationIdentifier, route] of activeConversationRoutes) {
       if (route.expiresAtMilliseconds <= currentTimeMilliseconds) {
@@ -395,6 +423,7 @@ export function createClaudeChannelServer(
     return mcpTransportClosePromise;
   };
   const inFlightDeliveries = new Set<Promise<void>>();
+  const inFlightToolCalls = new Set<Promise<CallToolResult>>();
 
   const performEnvelopeDelivery = async (
     inputEnvelope: AgentMessageEnvelope,
@@ -411,102 +440,94 @@ export function createClaudeChannelServer(
       inputEnvelope,
       owningSession,
     );
-    const currentTimeMilliseconds = currentDate().getTime();
-    pruneExpiredConversationRoutes(currentTimeMilliseconds);
-    let existingConversationRoute = activeConversationRoutes.get(
-      envelope.conversationId,
-    );
-    if (existingConversationRoute !== undefined) {
-      const authorizedSender = existingConversationRoute.authorizedSender;
-      const activeAuthorizedSender = await findSession(
-        authorizedSender.sessionId,
-        { runtime: "codex", projectId: authorizedSender.projectId },
-        options.stateHomeDirectory,
+    return runConversationOperation(envelope.conversationId, async () => {
+      if (closing || deliveryAbortSignal.aborted) {
+        await closeMcpTransport().catch(() => undefined);
+        throw new Error("Channel notification delivery was aborted");
+      }
+      const currentTimeMilliseconds = currentDate().getTime();
+      pruneExpiredConversationRoutes(currentTimeMilliseconds);
+      let existingConversationRoute = activeConversationRoutes.get(
+        envelope.conversationId,
       );
+      if (existingConversationRoute !== undefined) {
+        const authorizedSender = existingConversationRoute.authorizedSender;
+        const activeAuthorizedSender = await findSession(
+          authorizedSender.sessionId,
+          { runtime: "codex", projectId: authorizedSender.projectId },
+          options.stateHomeDirectory,
+        );
+        if (
+          activeAuthorizedSender === undefined ||
+          activeAuthorizedSender.runtime !== "codex" ||
+          activeAuthorizedSender.sessionId !== authorizedSender.sessionId ||
+          activeAuthorizedSender.projectId !== authorizedSender.projectId
+        ) {
+          activeConversationRoutes.delete(envelope.conversationId);
+          existingConversationRoute = undefined;
+        }
+      }
       if (
-        activeAuthorizedSender === undefined ||
-        activeAuthorizedSender.runtime !== "codex" ||
-        activeAuthorizedSender.sessionId !== authorizedSender.sessionId ||
-        activeAuthorizedSender.projectId !== authorizedSender.projectId
+        existingConversationRoute !== undefined &&
+        agentAddressKey(existingConversationRoute.authorizedSender) !==
+          agentAddressKey(envelope.sender)
       ) {
-        activeConversationRoutes.delete(envelope.conversationId);
-        existingConversationRoute = undefined;
+        throw new Error("Conversation belongs to a different Codex sender");
       }
-    }
-    if (
-      existingConversationRoute !== undefined &&
-      agentAddressKey(existingConversationRoute.authorizedSender) !==
-        agentAddressKey(envelope.sender)
-    ) {
-      throw new Error("Conversation belongs to a different Codex sender");
-    }
-    const pendingConversationSender = pendingConversationSenders.get(
-      envelope.conversationId,
-    );
-    if (
-      pendingConversationSender !== undefined &&
-      agentAddressKey(pendingConversationSender) !== agentAddressKey(envelope.sender)
-    ) {
-      throw new Error("Conversation belongs to a different Codex sender");
-    }
-    if (pendingConversationSender !== undefined) {
-      throw new Error("Conversation notification delivery is already in progress");
-    }
-    pendingConversationSenders.set(envelope.conversationId, envelope.sender);
-    let abortedTransportClosePromise: Promise<void> | undefined;
-    const closeTransportAfterAbort = (): void => {
-      if (abortedTransportClosePromise === undefined) {
-        abortedTransportClosePromise = closeMcpTransport().catch(() => undefined);
-      }
-    };
-    const awaitTransportCloseAfterAbort = async (): Promise<void> => {
-      closeTransportAfterAbort();
-      await abortedTransportClosePromise;
-    };
-    deliveryAbortSignal.addEventListener("abort", closeTransportAfterAbort, {
-      once: true,
-    });
-    try {
-      if (deliveryAbortSignal.aborted) {
-        await awaitTransportCloseAfterAbort();
-        throw new Error("Channel notification delivery was aborted");
-      }
-      await notificationSender({
-        method: "notifications/claude/channel",
-        params: {
-          content: envelope.content,
-          meta: {
-            message_id: envelope.messageId,
-            conversation_id: envelope.conversationId,
-            sender_runtime: envelope.sender.runtime,
-            sender_session_id: envelope.sender.sessionId,
-            message_type: envelope.messageType,
-          },
-        },
+      let abortedTransportClosePromise: Promise<void> | undefined;
+      const closeTransportAfterAbort = (): void => {
+        if (abortedTransportClosePromise === undefined) {
+          abortedTransportClosePromise = closeMcpTransport().catch(() => undefined);
+        }
+      };
+      const awaitTransportCloseAfterAbort = async (): Promise<void> => {
+        closeTransportAfterAbort();
+        await abortedTransportClosePromise;
+      };
+      deliveryAbortSignal.addEventListener("abort", closeTransportAfterAbort, {
+        once: true,
       });
-      if (deliveryAbortSignal.aborted) {
-        await awaitTransportCloseAfterAbort();
-        throw new Error("Channel notification delivery was aborted");
+      try {
+        if (deliveryAbortSignal.aborted) {
+          await awaitTransportCloseAfterAbort();
+          throw new Error("Channel notification delivery was aborted");
+        }
+        await notificationSender({
+          method: "notifications/claude/channel",
+          params: {
+            content: envelope.content,
+            meta: {
+              message_id: envelope.messageId,
+              conversation_id: envelope.conversationId,
+              sender_runtime: envelope.sender.runtime,
+              sender_session_id: envelope.sender.sessionId,
+              message_type: envelope.messageType,
+            },
+          },
+        });
+        if (deliveryAbortSignal.aborted) {
+          await awaitTransportCloseAfterAbort();
+          throw new Error("Channel notification delivery was aborted");
+        }
+      } catch (error) {
+        activeConversationRoutes.delete(envelope.conversationId);
+        if (deliveryAbortSignal.aborted) {
+          await awaitTransportCloseAfterAbort();
+          throw new Error("Channel notification delivery was aborted");
+        }
+        throw error;
+      } finally {
+        deliveryAbortSignal.removeEventListener("abort", closeTransportAfterAbort);
       }
-    } catch (error) {
-      activeConversationRoutes.delete(envelope.conversationId);
-      if (deliveryAbortSignal.aborted) {
-        await awaitTransportCloseAfterAbort();
-        throw new Error("Channel notification delivery was aborted");
-      }
-      throw error;
-    } finally {
-      deliveryAbortSignal.removeEventListener("abort", closeTransportAfterAbort);
-      pendingConversationSenders.delete(envelope.conversationId);
-    }
-    storeConversationRoute(
-      envelope.conversationId,
-      {
-        authorizedSender: envelope.sender,
-        replyRoute: envelope.replyRoute,
-      },
-      currentDate().getTime(),
-    );
+      storeConversationRoute(
+        envelope.conversationId,
+        {
+          authorizedSender: envelope.sender,
+          replyRoute: envelope.replyRoute,
+        },
+        currentDate().getTime(),
+      );
+    });
   };
   const deliverEnvelope = (
     inputEnvelope: AgentMessageEnvelope,
@@ -525,133 +546,166 @@ export function createClaudeChannelServer(
   mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: channelTools,
   }));
+  const performToolCall = async (
+    request: CallToolRequest,
+    externalAbortSignal: AbortSignal,
+  ): Promise<CallToolResult> => {
+    const toolCallAbortSignal = AbortSignal.any([
+      externalAbortSignal,
+      internalCloseAbortController.signal,
+    ]);
+    try {
+      if (closing || toolCallAbortSignal.aborted) {
+        throw new Error("Claude Channel server is closing");
+      }
+      if (request.params.name === "list_codex_sessions") {
+        const argumentsValue = listSessionsArgumentsSchema.parse(
+          request.params.arguments ?? {},
+        );
+        const projectIdentifier =
+          argumentsValue.project === undefined
+            ? undefined
+            : await resolveProjectIdentity(argumentsValue.project);
+        const sessions = await listSessions(
+          { runtime: "codex", projectId: projectIdentifier },
+          options.stateHomeDirectory,
+        );
+        return successfulToolResult(
+          JSON.stringify({ sessions: sessions.map(activeSessionOutput) }),
+        );
+      }
+
+      if (request.params.name === "send_to_codex") {
+        const argumentsValue = sendMessageArgumentsSchema.parse(
+          request.params.arguments ?? {},
+        );
+        const targetSession = await findSession(
+          argumentsValue.session_id,
+          { runtime: "codex" },
+          options.stateHomeDirectory,
+        );
+        if (
+          targetSession === undefined ||
+          targetSession.runtime !== "codex" ||
+          targetSession.sessionId !== argumentsValue.session_id
+        ) {
+          throw new Error("Target Codex session is not active");
+        }
+        const conversationIdentifier = randomIdentifier();
+        const envelope = createOutboundEnvelope(
+          owningSession,
+          {
+            runtime: "codex",
+            sessionId: targetSession.sessionId,
+            projectId: targetSession.projectId,
+          },
+          conversationIdentifier,
+          argumentsValue.message_type,
+          argumentsValue.content,
+          randomIdentifier,
+          currentDate,
+        );
+        await queueMessage({
+          targetSessionId: targetSession.sessionId,
+          envelope,
+          signal: toolCallAbortSignal,
+        });
+        return successfulToolResult(
+          JSON.stringify({
+            queued: true,
+            message_id: envelope.messageId,
+            conversation_id: envelope.conversationId,
+            acknowledgement: "transport acknowledgement only",
+          }),
+        );
+      }
+
+      if (request.params.name === "reply_to_codex") {
+        const argumentsValue = replyMessageArgumentsSchema.parse(
+          request.params.arguments ?? {},
+        );
+        return await runConversationOperation(
+          argumentsValue.conversation_id,
+          async () => {
+            if (closing || toolCallAbortSignal.aborted) {
+              throw new Error("Claude Channel server is closing");
+            }
+            const currentTimeMilliseconds = currentDate().getTime();
+            pruneExpiredConversationRoutes(currentTimeMilliseconds);
+            const conversationRoute = activeConversationRoutes.get(
+              argumentsValue.conversation_id,
+            );
+            if (conversationRoute?.replyRoute === undefined) {
+              throw new Error(
+                "No active in-memory route exists for this conversation",
+              );
+            }
+            const recipient = conversationRoute.replyRoute;
+            const targetSession = await findSession(
+              recipient.sessionId,
+              { runtime: "codex", projectId: recipient.projectId },
+              options.stateHomeDirectory,
+            );
+            if (
+              targetSession === undefined ||
+              targetSession.runtime !== "codex" ||
+              targetSession.sessionId !== recipient.sessionId ||
+              targetSession.projectId !== recipient.projectId
+            ) {
+              activeConversationRoutes.delete(argumentsValue.conversation_id);
+              throw new Error("Codex reply route is offline");
+            }
+            const envelope = createOutboundEnvelope(
+              owningSession,
+              recipient,
+              argumentsValue.conversation_id,
+              "reply",
+              argumentsValue.content,
+              randomIdentifier,
+              currentDate,
+            );
+            await queueMessage({
+              targetSessionId: recipient.sessionId,
+              envelope,
+              signal: toolCallAbortSignal,
+            });
+            if (toolCallAbortSignal.aborted) {
+              throw new Error("Claude Channel server is closing");
+            }
+            storeConversationRoute(
+              argumentsValue.conversation_id,
+              {
+                authorizedSender: conversationRoute.authorizedSender,
+                replyRoute: conversationRoute.replyRoute,
+              },
+              currentTimeMilliseconds,
+            );
+            return successfulToolResult(
+              JSON.stringify({
+                queued: true,
+                message_id: envelope.messageId,
+                conversation_id: envelope.conversationId,
+                acknowledgement: "transport acknowledgement only",
+              }),
+            );
+          },
+        );
+      }
+
+      throw new Error("Unknown Channel tool");
+    } catch (error) {
+      return failedToolResult(error);
+    }
+  };
   mcpServer.setRequestHandler(
     CallToolRequestSchema,
-    async (request): Promise<CallToolResult> => {
-      try {
-        if (request.params.name === "list_codex_sessions") {
-          const argumentsValue = listSessionsArgumentsSchema.parse(
-            request.params.arguments ?? {},
-          );
-          const projectIdentifier =
-            argumentsValue.project === undefined
-              ? undefined
-              : await resolveProjectIdentity(argumentsValue.project);
-          const sessions = await listSessions(
-            { runtime: "codex", projectId: projectIdentifier },
-            options.stateHomeDirectory,
-          );
-          return successfulToolResult(
-            JSON.stringify({ sessions: sessions.map(activeSessionOutput) }),
-          );
-        }
-
-        if (request.params.name === "send_to_codex") {
-          const argumentsValue = sendMessageArgumentsSchema.parse(
-            request.params.arguments ?? {},
-          );
-          const targetSession = await findSession(
-            argumentsValue.session_id,
-            { runtime: "codex" },
-            options.stateHomeDirectory,
-          );
-          if (
-            targetSession === undefined ||
-            targetSession.runtime !== "codex" ||
-            targetSession.sessionId !== argumentsValue.session_id
-          ) {
-            throw new Error("Target Codex session is not active");
-          }
-          const conversationIdentifier = randomIdentifier();
-          const envelope = createOutboundEnvelope(
-            owningSession,
-            {
-              runtime: "codex",
-              sessionId: targetSession.sessionId,
-              projectId: targetSession.projectId,
-            },
-            conversationIdentifier,
-            argumentsValue.message_type,
-            argumentsValue.content,
-            randomIdentifier,
-            currentDate,
-          );
-          await queueMessage({
-            targetSessionId: targetSession.sessionId,
-            envelope,
-          });
-          return successfulToolResult(
-            JSON.stringify({
-              queued: true,
-              message_id: envelope.messageId,
-              conversation_id: envelope.conversationId,
-              acknowledgement: "transport acknowledgement only",
-            }),
-          );
-        }
-
-        if (request.params.name === "reply_to_codex") {
-          const argumentsValue = replyMessageArgumentsSchema.parse(
-            request.params.arguments ?? {},
-          );
-          const currentTimeMilliseconds = currentDate().getTime();
-          pruneExpiredConversationRoutes(currentTimeMilliseconds);
-          const conversationRoute = activeConversationRoutes.get(
-            argumentsValue.conversation_id,
-          );
-          if (conversationRoute?.replyRoute === undefined) {
-            throw new Error("No active in-memory route exists for this conversation");
-          }
-          const recipient = conversationRoute.replyRoute;
-          const targetSession = await findSession(
-            recipient.sessionId,
-            { runtime: "codex", projectId: recipient.projectId },
-            options.stateHomeDirectory,
-          );
-          if (
-            targetSession === undefined ||
-            targetSession.runtime !== "codex" ||
-            targetSession.sessionId !== recipient.sessionId ||
-            targetSession.projectId !== recipient.projectId
-          ) {
-            activeConversationRoutes.delete(argumentsValue.conversation_id);
-            throw new Error("Codex reply route is offline");
-          }
-          storeConversationRoute(
-            argumentsValue.conversation_id,
-            {
-              authorizedSender: conversationRoute.authorizedSender,
-              replyRoute: conversationRoute.replyRoute,
-            },
-            currentTimeMilliseconds,
-          );
-          const envelope = createOutboundEnvelope(
-            owningSession,
-            recipient,
-            argumentsValue.conversation_id,
-            "reply",
-            argumentsValue.content,
-            randomIdentifier,
-            currentDate,
-          );
-          await queueMessage({
-            targetSessionId: recipient.sessionId,
-            envelope,
-          });
-          return successfulToolResult(
-            JSON.stringify({
-              queued: true,
-              message_id: envelope.messageId,
-              conversation_id: envelope.conversationId,
-              acknowledgement: "transport acknowledgement only",
-            }),
-          );
-        }
-
-        throw new Error("Unknown Channel tool");
-      } catch (error) {
-        return failedToolResult(error);
-      }
+    (request, extra): Promise<CallToolResult> => {
+      let trackedToolCall: Promise<CallToolResult>;
+      trackedToolCall = performToolCall(request, extra.signal).finally(() => {
+        inFlightToolCalls.delete(trackedToolCall);
+      });
+      inFlightToolCalls.add(trackedToolCall);
+      return trackedToolCall;
     },
   );
 
@@ -660,15 +714,16 @@ export function createClaudeChannelServer(
     if (closePromise === undefined) {
       closing = true;
       internalCloseAbortController.abort();
-      activeConversationRoutes.clear();
-      pendingConversationSenders.clear();
       closePromise = (async () => {
         const transportCloseResult = await Promise.allSettled([
           closeMcpTransport(),
         ]);
-        await Promise.allSettled([...inFlightDeliveries]);
+        await Promise.allSettled([
+          ...inFlightDeliveries,
+          ...inFlightToolCalls,
+        ]);
         activeConversationRoutes.clear();
-        pendingConversationSenders.clear();
+        conversationOperationTails.clear();
         const transportCloseError = transportCloseResult.find(
           (result): result is PromiseRejectedResult => result.status === "rejected",
         );
@@ -779,7 +834,7 @@ export async function startClaudeChannelServer(
 
   try {
     await channelServer.mcpServer.connect(
-      options.transport ?? new StdioServerTransport(),
+      options.transport ?? new CancellableStdioServerTransport(),
     );
     await mcpInitialization;
     if (!mcpInitialized || closing) {

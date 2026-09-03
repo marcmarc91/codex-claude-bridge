@@ -23,6 +23,7 @@ export interface QueueCodexMessageOptions {
   codexExecutablePath?: string;
   spawnProcess?: SpawnCodexProcess;
   timeoutMilliseconds?: number;
+  signal?: AbortSignal;
 }
 
 const defaultTimeoutMilliseconds = 10_000;
@@ -124,6 +125,9 @@ export async function queueCodexMessage(
   const timeoutMilliseconds = validateTimeoutMilliseconds(
     options.timeoutMilliseconds ?? defaultTimeoutMilliseconds,
   );
+  if (options.signal?.aborted === true) {
+    throw new Error("codex queue aborted");
+  }
   const spawnProcess = options.spawnProcess ?? (spawn as SpawnCodexProcess);
   const commandArguments = [
     "queue",
@@ -135,7 +139,7 @@ export async function queueCodexMessage(
 
   await new Promise<void>((resolveQueue, rejectQueue) => {
     let queueSettled = false;
-    let queueTimedOut = false;
+    let terminationError: Error | undefined;
     let childProcessClosed = false;
     let forceKillAttemptCompleted = false;
     let forceKillError: Error | undefined;
@@ -155,19 +159,30 @@ export async function queueCodexMessage(
       }
       queueSettled = true;
       clearTimeout(queueTimeout);
+      if (abortQueue !== undefined) {
+        options.signal?.removeEventListener("abort", abortQueue);
+      }
       if (error === undefined) {
         resolveQueue();
       } else {
         rejectQueue(error);
       }
     };
-    const settleTimedOutQueue = () => {
-      if (queueTimedOut && childProcessClosed && forceKillAttemptCompleted) {
-        settleQueue(forceKillError ?? new Error("codex queue timed out"));
+    const settleTerminatedQueue = () => {
+      if (
+        terminationError !== undefined &&
+        childProcessClosed &&
+        forceKillAttemptCompleted
+      ) {
+        settleQueue(forceKillError ?? terminationError);
       }
     };
-    const queueTimeout = setTimeout(() => {
-      queueTimedOut = true;
+    const beginTermination = (requestedTerminationError: Error) => {
+      if (terminationError !== undefined || queueSettled) {
+        return;
+      }
+      terminationError = requestedTerminationError;
+      clearTimeout(queueTimeout);
       try {
         signalCodexProcessGroup(childProcess, "SIGTERM");
       } catch {
@@ -178,14 +193,18 @@ export async function queueCodexMessage(
           signalCodexProcessGroup(childProcess, "SIGKILL");
         } catch {
           forceKillError = new Error(
-            "codex queue timed out and its process group could not be force killed",
+            `${requestedTerminationError.message} and its process group could not be force killed`,
           );
           signalDirectChildFallback(childProcess, "SIGKILL");
         }
         forceKillAttemptCompleted = true;
-        settleTimedOutQueue();
+        settleTerminatedQueue();
       }, forceKillGraceMilliseconds);
+    };
+    const queueTimeout = setTimeout(() => {
+      beginTermination(new Error("codex queue timed out"));
     }, timeoutMilliseconds);
+    let abortQueue: (() => void) | undefined;
 
     childProcess.stderr?.on("data", (chunk: Buffer | string) => {
       const chunkBytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -199,15 +218,15 @@ export async function queueCodexMessage(
       }
     });
     childProcess.once("error", () => {
-      if (queueTimedOut) {
+      if (terminationError !== undefined) {
         return;
       }
       settleQueue(new Error("codex queue could not be started"));
     });
     childProcess.once("close", (exitCode, terminationSignal) => {
       childProcessClosed = true;
-      if (queueTimedOut) {
-        settleTimedOutQueue();
+      if (terminationError !== undefined) {
+        settleTerminatedQueue();
         return;
       }
       if (exitCode === 0) {
@@ -228,5 +247,12 @@ export async function queueCodexMessage(
         ),
       );
     });
+    if (options.signal !== undefined) {
+      abortQueue = () => beginTermination(new Error("codex queue aborted"));
+      options.signal.addEventListener("abort", abortQueue, { once: true });
+      if (options.signal.aborted) {
+        abortQueue();
+      }
+    }
   });
 }

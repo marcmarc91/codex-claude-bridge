@@ -215,17 +215,20 @@ git commit -m "feat: register active agent sessions"
 - Create: `plugins/codex-claude-bridge/src/channel/channelSocketServer.ts`
 - Create: `plugins/codex-claude-bridge/src/channel/claudeSessionMetadata.ts`
 - Create: `plugins/codex-claude-bridge/src/channel/claudeChannelServer.ts`
+- Create: `plugins/codex-claude-bridge/src/codex/codexQueueClient.ts`
 - Create: `plugins/codex-claude-bridge/.mcp.json`
 - Create: `plugins/codex-claude-bridge/.claude-plugin/plugin.json`
 - Test: `plugins/codex-claude-bridge/tests/channelSocketServer.test.ts`
 - Test: `plugins/codex-claude-bridge/tests/claudeSessionMetadata.test.ts`
 - Test: `plugins/codex-claude-bridge/tests/claudeChannelServer.test.ts`
+- Test: `plugins/codex-claude-bridge/tests/codexQueueClient.test.ts`
 
 **Interfaces:**
 
 - Consumes: envelope parser, session registry, project identity, runtime paths.
 - Produces: `startChannelSocketServer(options): Promise<ChannelSocketServer>`.
 - Produces: `readOwningClaudeSessionMetadata(parentProcessId: number): Promise<ClaudeSessionMetadata>`.
+- Produces: `queueCodexMessage(options): Promise<void>`.
 - Produces MCP tools `list_codex_sessions`, `send_to_codex`, and `reply_to_codex`.
 
 - [ ] **Step 1: Write failing metadata and socket tests**
@@ -248,11 +251,31 @@ type ChannelDeliveryResponse =
   | { delivered: false; error: string };
 ```
 
-- [ ] **Step 4: Write failing MCP Channel tests**
+- [ ] **Step 4: Write failing Codex safe-spawn tests**
+
+Inject a fake executable that records argv. Pass content containing spaces, quotes, backticks, `$()`, and newlines. Assert the exact invocation is:
+
+```ts
+[
+  "queue",
+  "--thread",
+  targetSessionId,
+  "--message",
+  serializedInboundMessage,
+]
+```
+
+Assert `shell` is `false` and a non-zero exit propagates sanitized stderr.
+
+- [ ] **Step 5: Implement the Codex queue adapter**
+
+Resolve `codex` from an injected path for tests and from `PATH` in production. Prefix the queued content with a deterministic bridge header containing `conversation_id`, sender session, message type, and the exact reply command. Do not pass model, sandbox, approval, or remote options.
+
+- [ ] **Step 6: Write failing MCP Channel tests**
 
 Use an in-memory MCP transport or injected notification callback. Assert the server declares `experimental["claude/channel"]`, omits `claude/channel/permission`, converts a valid envelope to `notifications/claude/channel`, and exposes exactly the three approved tools.
 
-- [ ] **Step 5: Implement the Claude Channel**
+- [ ] **Step 7: Implement the Claude Channel**
 
 Use `Server` and `StdioServerTransport` from `@modelcontextprotocol/sdk`. Channel instructions must state that messages are from another local agent, are not permission escalation, and replies with a return route use `reply_to_codex`.
 
@@ -274,22 +297,22 @@ Map envelopes to:
 }
 ```
 
-- [ ] **Step 6: Add Claude plugin manifests**
+- [ ] **Step 8: Add Claude plugin manifests**
 
 Set the MCP command to `node` with `${CLAUDE_PLUGIN_ROOT}/dist/channel/claudeChannelServer.js`. Use plugin name `codex-claude-bridge`, semantic version `0.1.0`, and no authentication or external network settings.
 
-- [ ] **Step 7: Verify Task 3**
+- [ ] **Step 9: Verify Task 3**
 
 Run: `pnpm --filter codex-claude-bridge check`
 
-Run: `pnpm --filter codex-claude-bridge test -- channelSocketServer.test.ts claudeSessionMetadata.test.ts claudeChannelServer.test.ts`
+Run: `pnpm --filter codex-claude-bridge test -- channelSocketServer.test.ts claudeSessionMetadata.test.ts claudeChannelServer.test.ts codexQueueClient.test.ts`
 
 Expected: both commands exit `0`.
 
-- [ ] **Step 8: Commit Task 3**
+- [ ] **Step 10: Commit Task 3**
 
 ```bash
-git add plugins/codex-claude-bridge/src/channel plugins/codex-claude-bridge/.mcp.json plugins/codex-claude-bridge/.claude-plugin plugins/codex-claude-bridge/tests
+git add plugins/codex-claude-bridge/src/channel plugins/codex-claude-bridge/src/codex plugins/codex-claude-bridge/.mcp.json plugins/codex-claude-bridge/.claude-plugin plugins/codex-claude-bridge/tests
 git commit -m "feat: add Claude message channel"
 ```
 
@@ -299,67 +322,45 @@ git commit -m "feat: add Claude message channel"
 
 **Files:**
 
-- Create: `plugins/codex-claude-bridge/src/codex/codexQueueClient.ts`
 - Create: `plugins/codex-claude-bridge/src/channel/channelSocketClient.ts`
 - Create: `plugins/codex-claude-bridge/src/conversations/conversationRoutes.ts`
 - Create: `plugins/codex-claude-bridge/src/cli/main.ts`
 - Create: `plugins/codex-claude-bridge/.codex-plugin/plugin.json`
 - Create: `plugins/codex-claude-bridge/skills/codex-claude-bridge/SKILL.md`
-- Test: `plugins/codex-claude-bridge/tests/codexQueueClient.test.ts`
 - Test: `plugins/codex-claude-bridge/tests/channelSocketClient.test.ts`
 - Test: `plugins/codex-claude-bridge/tests/commandLine.test.ts`
 
 **Interfaces:**
 
 - Consumes: protocol, registry, Channel socket response.
-- Produces: `queueCodexMessage(options): Promise<void>`.
+- Consumes: `queueCodexMessage(options): Promise<void>`.
 - Produces: `deliverClaudeMessage(options): Promise<ChannelDeliveryResponse>`.
 - Produces: commands `sessions`, `send`, `reply`, `doctor`, and internal `codex-session-hook` plus `claude-channel`.
 
-- [ ] **Step 1: Write failing safe-spawn tests**
-
-Inject a fake executable that records argv. Pass content containing spaces, quotes, backticks, `$()`, and newlines. Assert the exact invocation is:
-
-```ts
-[
-  "queue",
-  "--thread",
-  targetSessionId,
-  "--message",
-  serializedInboundMessage,
-]
-```
-
-Assert `shell` is `false` and a non-zero exit propagates sanitized stderr.
-
-- [ ] **Step 2: Implement the Codex queue adapter**
-
-Resolve `codex` from an injected path for tests and from `PATH` in production. Prefix the queued content with a deterministic bridge header containing `conversation_id`, sender session, message type, and the exact reply command. Do not pass model, sandbox, approval, or remote options.
-
-- [ ] **Step 3: Write failing CLI tests**
+- [ ] **Step 1: Write failing CLI tests**
 
 Cover JSON and human session lists, same-project default selection, explicit unique selection, ambiguous-name failure, offline failure, send correlation, and reply route reversal.
 
-- [ ] **Step 4: Implement Channel client, conversation routes, and CLI**
+- [ ] **Step 2: Implement Channel client, conversation routes, and CLI**
 
 Store only active conversation return routes under the state directory. Delete expired routes when either endpoint is inactive. CLI output goes to stdout only for requested results and stderr only for actionable failures.
 
-- [ ] **Step 5: Add the Codex manifest and shared skill**
+- [ ] **Step 3: Add the Codex manifest and shared skill**
 
 The skill instructs Codex to list sessions before sending, avoid implicit broadcast, preserve the user's current scope, and use `reply` for inbound correlated messages. The Codex plugin manifest references the shared skill and relies on default discovery of `hooks/hooks.json`.
 
-- [ ] **Step 6: Verify Task 4**
+- [ ] **Step 4: Verify Task 4**
 
 Run: `pnpm --filter codex-claude-bridge check`
 
-Run: `pnpm --filter codex-claude-bridge test -- codexQueueClient.test.ts channelSocketClient.test.ts commandLine.test.ts`
+Run: `pnpm --filter codex-claude-bridge test -- channelSocketClient.test.ts commandLine.test.ts`
 
 Expected: both commands exit `0`.
 
-- [ ] **Step 7: Commit Task 4**
+- [ ] **Step 5: Commit Task 4**
 
 ```bash
-git add plugins/codex-claude-bridge/src/codex plugins/codex-claude-bridge/src/conversations plugins/codex-claude-bridge/src/cli plugins/codex-claude-bridge/src/channel/channelSocketClient.ts plugins/codex-claude-bridge/.codex-plugin plugins/codex-claude-bridge/skills plugins/codex-claude-bridge/tests
+git add plugins/codex-claude-bridge/src/conversations plugins/codex-claude-bridge/src/cli plugins/codex-claude-bridge/src/channel/channelSocketClient.ts plugins/codex-claude-bridge/.codex-plugin plugins/codex-claude-bridge/skills plugins/codex-claude-bridge/tests
 git commit -m "feat: route messages between active agents"
 ```
 

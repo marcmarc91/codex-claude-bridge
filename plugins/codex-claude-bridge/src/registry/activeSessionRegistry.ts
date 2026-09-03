@@ -28,6 +28,7 @@ const sessionLockMetadataSchema = z.object({
 }).strict();
 
 const lockMetadataGraceMilliseconds = 500;
+const lockLeaseMilliseconds = 2_000;
 
 function contained(parent: string, candidate: string): boolean { const child = relative(resolve(parent), resolve(candidate)); return child !== ".." && !child.startsWith(`..${sep}`) && !isAbsolute(child); }
 function registry(stateHome: string | undefined, projectId: string): string { const root = resolveBridgeStateDirectory(stateHome); return resolveSessionRegistryDirectory(dirname(root), projectIdentitySchema.parse(projectId)); }
@@ -50,28 +51,33 @@ async function secureExistingBridgePath(bridgeStateDirectory: string, existingPa
   } catch { return false; }
 }
 
-async function recoverStaleLock(lockDirectory: string, ownerPath: string): Promise<void> {
-  const bridgeStateDirectory = dirname(dirname(dirname(dirname(lockDirectory))));
-  if (!(await secureExistingBridgePath(bridgeStateDirectory, lockDirectory))) return;
-  let lockMetadata: z.infer<typeof sessionLockMetadataSchema> | undefined;
-  try { lockMetadata = sessionLockMetadataSchema.parse(JSON.parse(await readFile(ownerPath, "utf8"))); } catch { lockMetadata = undefined; }
-  const lockStatus = await lstat(lockDirectory).catch(() => undefined);
-  const metadataIsOld = lockStatus !== undefined && Date.now() - lockStatus.mtimeMs > lockMetadataGraceMilliseconds;
-  if ((lockMetadata !== undefined && !(await processActive(lockMetadata.processId))) || (lockMetadata === undefined && metadataIsOld)) {
-    const quarantineDirectory = `${lockDirectory}.quarantine-${randomUUID()}`;
-    try { await rename(lockDirectory, quarantineDirectory); await rm(quarantineDirectory, { recursive: true, force: true }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  }
-}
-
 async function withLock<T>(directory: string, sessionId: string, operation: () => Promise<T>): Promise<T> {
-  const directoryPath = lockPath(directory, sessionId); const ownerPath = join(directoryPath, "owner"); const ownerId = randomUUID();
-  await privateDirectory(dirname(directoryPath));
+  const ticketDirectory = lockPath(directory, sessionId); const ownerId = randomUUID();
+  await privateDirectory(ticketDirectory);
+  const ticketBaseName = `${Date.now().toString().padStart(16, "0")}-${ownerId}`;
+  const temporaryTicketPath = join(ticketDirectory, `.${ticketBaseName}.tmp`);
+  const ticketPath = join(ticketDirectory, `${ticketBaseName}.ticket`);
+  const ticketMetadata = JSON.stringify({ ownerId, processId: process.pid, acquiredAt: new Date().toISOString() });
+  const ticketFile = await open(temporaryTicketPath, "wx", 0o600);
+  await ticketFile.writeFile(ticketMetadata, "utf8");
+  await ticketFile.close();
+  await rename(temporaryTicketPath, ticketPath);
   for (let attempt = 0; attempt < 50; attempt += 1) {
-    try {
-      await mkdir(directoryPath, { mode: 0o700 }); await writeFile(ownerPath, JSON.stringify({ ownerId, processId: process.pid, acquiredAt: new Date().toISOString() }), { mode: 0o600, flag: "wx" });
-      try { return await operation(); } finally { if (sessionLockMetadataSchema.safeParse(JSON.parse(await readFile(ownerPath, "utf8").catch(() => "null"))).data?.ownerId === ownerId) await rm(directoryPath, { recursive: true, force: true }); }
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; await recoverStaleLock(directoryPath, ownerPath); await delay(10); }
+    const ticketNames = await readdir(ticketDirectory);
+    for (const ticketName of ticketNames.filter((name) => name.endsWith(".ticket"))) {
+      const candidateTicketPath = join(ticketDirectory, ticketName);
+      const candidateTicketMetadata = sessionLockMetadataSchema.safeParse(JSON.parse(await readFile(candidateTicketPath, "utf8").catch(() => "null")));
+      if (!candidateTicketMetadata.success) continue;
+      const ticketAge = Date.now() - Date.parse(candidateTicketMetadata.data.acquiredAt);
+      if (!(await processActive(candidateTicketMetadata.data.processId)) || ticketAge > lockLeaseMilliseconds) await unlink(candidateTicketPath).catch(() => undefined);
+    }
+    const activeTicketNames = (await readdir(ticketDirectory)).filter((name) => name.endsWith(".ticket")).sort();
+    if (activeTicketNames[0] === `${ticketBaseName}.ticket`) {
+      try { return await operation(); } finally { await unlink(ticketPath).catch(() => undefined); }
+    }
+    await delay(10);
   }
+  await unlink(ticketPath).catch(() => undefined);
   throw new Error("Timed out waiting for a session mutation lock");
 }
 

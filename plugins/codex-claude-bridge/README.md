@@ -6,7 +6,7 @@ This package contains the shared runtime for the user-scoped Codex-Claude Bridge
 
 - `codex-claude-bridge`: session discovery, explicit delivery, correlated replies, installation, uninstallation, and diagnostics
 - `claude-code-bridge-wrapper`: starts the real Claude executable with the bridge development Channel selected exactly once
-- Codex `SessionStart` and `SessionEnd` hooks: publish and remove ephemeral Codex session registrations
+- Codex `SessionStart` and `SessionEnd` hooks: delegate to the globally linked CLI to publish and remove ephemeral Codex session registrations
 - Codex skill: instructs Codex to list sessions, select one target, and preserve the user's task and permission scope
 - Claude MCP Channel: owns one Unix socket per active Claude session and injects accepted messages as Channel notifications
 
@@ -38,6 +38,8 @@ codex-claude-bridge uninstall --global [--confirm-pending-command-stopped]
 ```
 
 Internal plugin entry points are `codex-session-hook` and `claude-channel`; they are not operator registration commands.
+
+The Codex hook manifest invokes `codex-claude-bridge` from `PATH` instead of loading JavaScript from the Codex plugin cache. The supported installer therefore creates the npm global link before installing the plugin and removes that link only after uninstalling the plugin.
 
 Messages use strict UUID-based envelopes, canonical UTC timestamps, explicit sender and recipient addresses, and at most 65,536 UTF-8 bytes of content. Unknown envelope fields are rejected. Replies retain the conversation UUID and reverse the route.
 

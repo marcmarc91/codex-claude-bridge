@@ -153,7 +153,7 @@ codex-claude-bridge install --global
 codex-claude-bridge uninstall --global
 ```
 
-Plugin manifests invoke the internal `codex-session-hook` and `claude-channel` subcommands. Installation and uninstallation own plugin registration; there are no separate public hook-registration commands.
+Plugin manifests invoke the internal `codex-session-hook` and `claude-channel` subcommands. The Codex hook invokes `codex-claude-bridge` through the npm global link instead of depending on packages inside the Codex plugin cache. Installation creates that link before plugin registration, and uninstallation removes it last. There are no separate public hook-registration commands.
 
 The Claude Channel exposes only:
 
@@ -179,7 +179,7 @@ The Channel instructions tell Claude that inbound content comes from another loc
 
 ## Codex Integration
 
-The repository is added as a local Codex marketplace and installed as a global Codex plugin. Its hooks register and unregister sessions, while its skill describes how to select a target and invoke the bridge CLI. Inbound text sent through `codex queue` includes a compact, deterministic prefix identifying it as a bridge message and providing the conversation ID and reply command.
+The repository is added as a local Codex marketplace and installed as a global Codex plugin. Its hooks call the globally linked bridge CLI to register and unregister sessions, while its skill describes how to select a target and invoke the same CLI. Inbound text sent through `codex queue` includes a compact, deterministic prefix identifying it as a bridge message and providing the conversation ID and reply command.
 
 The bridge never passes `--dangerously-bypass-approvals-and-sandbox`, never changes the target thread's model, and never overrides its active permission profile.
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -27,6 +27,7 @@ interface ManifestCommandHook {
 interface HookManifest {
   hooks: {
     SessionStart?: Array<{ hooks?: ManifestCommandHook[] }>;
+    SessionEnd?: Array<{ hooks?: ManifestCommandHook[] }>;
   };
 }
 
@@ -64,15 +65,18 @@ async function invokeManifestCommand(
   serializedInput: string,
   stateHomeDirectory: string,
   workingDirectory: string,
+  pluginRootDirectory = pluginDirectory,
+  executableSearchPath = "/opt/homebrew/bin:/usr/bin:/bin",
 ): Promise<ManifestInvocationResult> {
   return new Promise((resolveProcess, rejectProcess) => {
     const childProcess = spawn("/bin/zsh", ["-lc", manifestHook.command], {
       cwd: workingDirectory,
       env: {
         ...process.env,
-        PATH: "/opt/homebrew/bin:/usr/bin:/bin",
-        PLUGIN_ROOT: pluginDirectory,
+        PATH: executableSearchPath,
+        PLUGIN_ROOT: pluginRootDirectory,
         XDG_STATE_HOME: stateHomeDirectory,
+        ZDOTDIR: join(stateHomeDirectory, "zsh"),
       },
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
@@ -181,48 +185,95 @@ test("hook-ul oprește citirea imediat ce stdin depășește limita UTF-8", asyn
   assert.equal(readPastLimit, false);
 });
 
-test("comanda SessionStart din manifest păstrează semantica reală a PID-ului părinte", async (testContext) => {
-  const stateHomeDirectory = await mkdtemp(join(tmpdir(), "ccb-manifest-"));
-  testContext.after(() => rm(stateHomeDirectory, { recursive: true, force: true }));
+test("comenzile manifestului rulează dintr-un cache fără dependențe și păstrează ciclul de viață al PID-ului părinte", async (testContext) => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "ccb-manifest-"));
+  const stateHomeDirectory = join(temporaryDirectory, "state");
+  const cachedPluginDirectory = join(temporaryDirectory, "plugin-cache");
+  const temporaryBinaryDirectory = join(temporaryDirectory, "bin");
+  testContext.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
   await executeFile(join(pluginDirectory, "node_modules/.bin/tsc"), ["-p", "tsconfig.json"], {
     cwd: pluginDirectory,
   });
+  await mkdir(cachedPluginDirectory, { recursive: true });
+  await cp(join(pluginDirectory, "dist"), join(cachedPluginDirectory, "dist"), {
+    recursive: true,
+  });
+  await mkdir(temporaryBinaryDirectory, { recursive: true });
+  await mkdir(join(stateHomeDirectory, "zsh"), { recursive: true });
+  await symlink(
+    join(pluginDirectory, "dist/bin/codexClaudeBridge.js"),
+    join(temporaryBinaryDirectory, "codex-claude-bridge"),
+  );
 
   const manifest = JSON.parse(
     await readFile(join(pluginDirectory, "hooks/hooks.json"), "utf8"),
   ) as HookManifest;
   const sessionStartHook = manifest.hooks.SessionStart?.[0]?.hooks?.[0];
+  const sessionEndHook = manifest.hooks.SessionEnd?.[0]?.hooks?.[0];
   assert.ok(sessionStartHook);
+  assert.ok(sessionEndHook);
   assert.equal(sessionStartHook.timeout, 5);
 
-  const sessionIdentifier = "8d6380bf-1b93-44b3-b3da-a1a661cf8b69";
+  const sessionIdentifier = "01994b35-1234-7abc-8def-0123456789ab";
   const workingDirectory = pluginDirectory;
-  const invocation = await invokeManifestCommand(
+  const executableSearchPath = `${temporaryBinaryDirectory}:/opt/homebrew/bin:/usr/bin:/bin`;
+  const startInvocation = await invokeManifestCommand(
     sessionStartHook,
     JSON.stringify({
       hook_event_name: "SessionStart",
       session_id: sessionIdentifier,
       cwd: workingDirectory,
+      model: "gpt-5.6-sol",
+      permission_mode: "default",
+      source: "startup",
+      transcript_path: null,
     }),
     stateHomeDirectory,
     workingDirectory,
+    cachedPluginDirectory,
+    executableSearchPath,
   );
 
-  assert.equal(invocation.timedOut, false, invocation.standardError);
-  assert.equal(invocation.exitCode, 0, invocation.standardError);
-  assert.equal(invocation.signal, null);
-  assert.equal(invocation.standardOutput, "");
-  assert.notEqual(invocation.spawnedProcessIdentifier, process.pid);
+  assert.equal(startInvocation.timedOut, false, startInvocation.standardError);
+  assert.equal(startInvocation.exitCode, 0, startInvocation.standardError);
+  assert.equal(startInvocation.signal, null);
+  assert.equal(startInvocation.standardOutput, "");
+  assert.notEqual(startInvocation.spawnedProcessIdentifier, process.pid);
+  assert.equal(sessionEndHook.timeout, 3);
 
   const projectIdentifier = await resolveProjectIdentity(workingDirectory);
+  const sessionRecordPath = join(
+    resolveSessionRegistryDirectory(stateHomeDirectory, projectIdentifier),
+    `${sessionIdentifier}.json`,
+  );
   const storedRecord = JSON.parse(
-    await readFile(
-      join(
-        resolveSessionRegistryDirectory(stateHomeDirectory, projectIdentifier),
-        `${sessionIdentifier}.json`,
-      ),
-      "utf8",
-    ),
+    await readFile(sessionRecordPath, "utf8"),
   ) as { processId: number };
   assert.equal(storedRecord.processId, process.pid);
+  assert.doesNotThrow(() => process.kill(storedRecord.processId, 0));
+
+  const endInvocation = await invokeManifestCommand(
+    sessionEndHook,
+    JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: sessionIdentifier,
+      cwd: workingDirectory,
+    }),
+    stateHomeDirectory,
+    workingDirectory,
+    cachedPluginDirectory,
+    executableSearchPath,
+  );
+
+  assert.equal(endInvocation.timedOut, false, endInvocation.standardError);
+  assert.equal(endInvocation.exitCode, 0, endInvocation.standardError);
+  assert.equal(endInvocation.signal, null);
+  assert.equal(endInvocation.standardOutput, "");
+  assert.deepEqual(
+    await listActiveSessions(
+      { runtime: "codex", projectId: projectIdentifier },
+      stateHomeDirectory,
+    ),
+    [],
+  );
 });

@@ -695,9 +695,6 @@ test("keeps Claude MCP inline and leaves no root MCP configuration discoverable 
   const codexManifest = JSON.parse(
     await readFile(join(packageDirectory, ".codex-plugin", "plugin.json"), "utf8"),
   );
-  const hookManifest = JSON.parse(
-    await readFile(join(packageDirectory, "hooks", "hooks.json"), "utf8"),
-  );
   const skill = await readFile(
     join(packageDirectory, "skills", "codex-claude-bridge", "SKILL.md"),
     "utf8",
@@ -726,8 +723,4 @@ test("keeps Claude MCP inline and leaves no root MCP configuration discoverable 
   assert.match(skill, /Never broadcast/u);
   assert.match(skill, /current task scope/u);
   assert.match(skill, /reply --conversation/u);
-  assert.match(
-    hookManifest.hooks.SessionStart[0].hooks[0].command,
-    /dist\/bin\/codexClaudeBridge\.js" codex-session-hook$/u,
-  );
 });

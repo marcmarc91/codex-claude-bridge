@@ -181,15 +181,16 @@ Assert start registers and end unregisters only the specified session.
 
 - [ ] **Step 5: Implement the Codex hook and manifest**
 
-Read one JSON object from stdin. Use `process.ppid` as the owning process and produce no stdout context. Configure `SessionStart` and `SessionEnd` in `hooks/hooks.json` with:
+Read one JSON object from stdin. Use `process.ppid` as the owning process and produce no stdout context. Delegate through the globally linked CLI so the hook does not depend on packages copied into the Codex plugin cache. Configure both events in `hooks/hooks.json` with:
 
 ```json
 {
   "type": "command",
-  "command": "node \"${PLUGIN_ROOT}/dist/hooks/codexSessionHook.js\"",
-  "timeout": 5
+  "command": "exec codex-claude-bridge codex-session-hook"
 }
 ```
+
+Use a five-second timeout for `SessionStart` and the Codex-supported maximum of three seconds for `SessionEnd`.
 
 - [ ] **Step 6: Verify Task 2**
 

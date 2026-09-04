@@ -208,9 +208,9 @@ The bridge never passes `--dangerously-bypass-approvals-and-sandbox`, never chan
 
 ## Installation
 
-The source repository lives at `/Users/bogdanmarc/Projects/codex-claude-bridge`. Installation builds the TypeScript package, links the CLI globally, registers local plugin marketplace entries, installs the Codex hook integration, installs the Claude plugin, and configures the VS Code process wrapper. Every global file mutation is enumerated before it is applied, and the installer provides a reversible uninstall command.
+The source repository lives in a dedicated checkout outside application repositories. Installation builds the TypeScript package, links the CLI globally, registers local plugin marketplace entries, installs the Codex hook integration, installs the Claude plugin, and configures the VS Code process wrapper. Every global file mutation is enumerated before it is applied, and the installer provides a reversible uninstall command.
 
-Pinvite and other application repositories remain unchanged.
+Application repositories remain unchanged.
 
 ## Verification
 
@@ -231,7 +231,7 @@ The live smoke test must demonstrate:
 3. Codex sends a question that wakes Claude.
 4. Claude replies through `codex queue` and wakes the originating Codex thread.
 5. Both agents retain their existing permission modes.
-6. `git status --short` in Pinvite is byte-for-byte unchanged from the pre-install snapshot.
+6. `git status --short` in the application repository is byte-for-byte unchanged from the pre-install snapshot.
 
 ## Acceptance Criteria
 
@@ -239,4 +239,4 @@ The live smoke test must demonstrate:
 - Only currently active sessions are addressable.
 - Direct Codex-to-Claude and Claude-to-Codex round trips succeed.
 - Claude-to-Claude traffic remains on native cross-session messaging.
-- No daemon, poller, TCP listener, offline queue, permission relay, credential access, Pinvite dependency, Pinvite commit, or push is introduced.
+- No daemon, poller, TCP listener, offline queue, permission relay, credential access, application-repository dependency, application-repository commit, or push is introduced.

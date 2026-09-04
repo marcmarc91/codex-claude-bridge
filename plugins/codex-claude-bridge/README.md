@@ -39,7 +39,7 @@ codex-claude-bridge uninstall --global [--confirm-pending-command-stopped]
 
 Internal plugin entry points are `codex-session-hook` and `claude-channel`; they are not operator registration commands.
 
-The Codex hook manifest invokes `codex-claude-bridge` from `PATH` instead of loading JavaScript from the Codex plugin cache. The supported installer therefore creates the npm global link before installing the plugin and removes that link only after uninstalling the plugin.
+The Codex hook and Claude MCP manifests invoke `codex-claude-bridge` from `PATH` instead of loading JavaScript from a plugin cache. The supported installer therefore creates and verifies the npm global link before installing either plugin, and removes that link only after uninstalling both plugins. The VS Code process wrapper prepends the global `bin` directory to Claude's `PATH`; the installer, Codex, and a directly started Claude process must already resolve it.
 
 Messages use strict UUID-based envelopes, canonical UTC timestamps, explicit sender and recipient addresses, and at most 65,536 UTF-8 bytes of content. Unknown envelope fields are rejected. Replies retain the conversation UUID and reverse the route.
 

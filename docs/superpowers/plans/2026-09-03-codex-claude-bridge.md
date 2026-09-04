@@ -6,7 +6,7 @@
 
 **Architecture:** A Claude MCP Channel owns one Unix socket per active Claude session, while Codex session hooks publish ephemeral active-session records. The CLI sends directly to Claude sockets and delegates Claude-to-Codex delivery to `codex queue`, preserving each runtime's wake-up and permission behavior.
 
-**Tech Stack:** Node.js 22+, TypeScript, pnpm 10, `@modelcontextprotocol/sdk`, Zod, Node test runner through `tsx`.
+**Tech Stack:** Node.js 22+, TypeScript, pnpm 9, `@modelcontextprotocol/sdk`, Zod, Node test runner through `tsx`.
 
 **Spec:** `docs/superpowers/specs/2026-09-03-codex-claude-bridge-design.md`
 
@@ -20,7 +20,7 @@
 - Use Unix sockets and user-only `0700` directories plus `0600` files.
 - Spawn child processes with argument arrays and `shell: false`.
 - Use descriptive English identifiers and add no source-code comments or diagnostic logging.
-- Make no changes or commits in `/Users/bogdanmarc/Projects/pinvite-ui`.
+- Make no changes or commits in any application repository.
 
 ---
 
@@ -300,7 +300,7 @@ Map envelopes to:
 
 - [ ] **Step 8: Add Claude plugin manifests**
 
-Set the MCP command to `node` with `${CLAUDE_PLUGIN_ROOT}/dist/channel/claudeChannelServer.js`. Use plugin name `codex-claude-bridge`, semantic version `0.1.0`, and no authentication or external network settings.
+Set the MCP command to `codex-claude-bridge` with the `claude-channel` argument. Use plugin name `codex-claude-bridge`, semantic version `0.1.1`, and no authentication or external network settings.
 
 - [ ] **Step 9: Verify Task 3**
 
@@ -476,7 +476,7 @@ codex-claude-bridge send --from <id> --to <id> --type question --message "status
 codex-claude-bridge uninstall --global
 ```
 
-State that Claude sessions must restart after wrapper/plugin installation, custom Channels are experimental, only active sessions are reachable, permission relay is absent, and Pinvite is not modified.
+State that Claude sessions must restart after wrapper/plugin installation, custom Channels are experimental, only active sessions are reachable, permission relay is absent, and application repositories are not modified.
 
 - [ ] **Step 2: Run the complete automated verification**
 
@@ -488,7 +488,7 @@ Expected: both commands exit `0`.
 
 - [ ] **Step 3: Move the repository to its final location**
 
-Confirm `/Users/bogdanmarc/Projects/codex-claude-bridge` does not already exist, then move this repository there without copying or deleting any application repository content.
+Confirm the chosen dedicated bridge checkout does not already exist, then move this repository there without copying or deleting any application repository content.
 
 - [ ] **Step 4: Install globally**
 
@@ -506,9 +506,9 @@ Send a `question` from the current Codex thread to that Claude session. Require 
 
 Require the reply to enter the current thread through `codex queue`, wake the thread, and retain the current Codex permission profile.
 
-- [ ] **Step 8: Prove Pinvite isolation**
+- [ ] **Step 8: Prove application-repository isolation**
 
-Compare `git status --short` in `/Users/bogdanmarc/Projects/pinvite-ui` with the captured pre-install snapshot. Expected: byte-for-byte identical output.
+Compare `git status --short` in the application repository with the captured pre-install snapshot. Expected: byte-for-byte identical output.
 
 - [ ] **Step 9: Commit documentation and any tested compatibility correction**
 

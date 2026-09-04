@@ -14,7 +14,7 @@ There is no daemon, scheduler, polling loop, TCP listener, broadcast, or bridge-
 
 - macOS and one local user account for both runtimes
 - Node.js 22 or newer
-- npm with a writable global prefix
+- npm with a writable global prefix whose `bin` directory is present in the `PATH` used by the installer and Codex
 - pnpm 9
 - Codex 0.149.0 or newer
 - Claude Code 2.1.224 or newer
@@ -30,14 +30,18 @@ This selector loads the Channel. It does not bypass approvals, change a sandbox,
 
 ## Install
 
-Run from the repository root:
+Clone the repository and run the installer from its root:
 
 ```bash
-pnpm install
+git clone https://github.com/marcmarc91/codex-claude-bridge.git
+cd codex-claude-bridge
+pnpm install --frozen-lockfile
 pnpm verify
 pnpm --filter codex-claude-bridge bridge install --global
 codex-claude-bridge doctor
 ```
+
+Keep this checkout at the same path while the bridge is installed. The npm global link and both local marketplace registrations refer to this checkout. Run `codex-claude-bridge uninstall --global` before moving or deleting it.
 
 Before mutating global state, the installer prints the build, commands, paths, VS Code setting, and receipt it will manage. Installation:
 
@@ -48,18 +52,28 @@ Before mutating global state, the installer prints the build, commands, paths, V
 - sets `claudeCode.claudeProcessWrapper` in the VS Code user settings;
 - records owned changes in a private installation receipt.
 
-The installer does not write to application repositories.
+The installer does not write to application repositories. It also verifies that the global `codex-claude-bridge` command resolves from the installer's `PATH`. The VS Code process wrapper prepends that global `bin` directory to Claude's `PATH`; a Claude process started directly in a terminal must already inherit it.
 
 ## Activate new sessions
 
 Installation is not retroactive for processes that are already running.
 
-1. Reload the VS Code window, then open a new Claude Code session.
-2. Start a new Codex process, or resume a Codex thread in a new process.
-3. Accept the normal Codex hook-trust prompt if one is shown. Do not use `--dangerously-bypass-hook-trust`.
-4. Run `codex-claude-bridge doctor` again.
+For the VS Code extension:
 
-The Codex session hook runs on `SessionStart`, while the Claude Channel and process wrapper are loaded when the Claude process starts. A chat reset inside an existing process is not sufficient.
+1. Reload the VS Code window, then open a new Claude Code session. The configured process wrapper adds the development Channel selector.
+2. Approve Claude Code's development Channel confirmation when prompted.
+3. Start a new Codex process, or resume a Codex thread in a new process.
+4. Accept the normal Codex hook-trust prompt if one is shown. Do not use `--dangerously-bypass-hook-trust`.
+5. Run `codex-claude-bridge doctor` again.
+
+For Claude Code in a terminal, start a new process with the Channel selected explicitly:
+
+```bash
+claude --dangerously-load-development-channels \
+  plugin:codex-claude-bridge@codex-claude-bridge-local
+```
+
+The Codex session hook runs on `SessionStart`, while the Claude Channel and process wrapper are loaded when the Claude process starts. A chat reset such as `/clear` inside an existing process is not sufficient.
 
 ## CLI
 
@@ -203,6 +217,7 @@ Conversation routes expire and are removed when either endpoint is no longer act
 - **A target name is ambiguous:** repeat the command with the session UUID shown by `sessions`.
 - **Claude does not register:** reload the VS Code window and open a new Claude Code session so the process wrapper can load the Channel.
 - **Codex does not register:** start or resume the thread in a new Codex process; hooks are not injected into an already running process.
+- **The global bridge command is unavailable through `PATH`:** add the npm global `bin` directory to the terminal environment used by the installer, Codex, or a directly started Claude process, then reinstall and start fresh sessions. The VS Code wrapper adds it to Claude automatically.
 - **A transport acknowledgement has no model reply:** the acknowledgement does not mean the model completed a turn. Confirm that the target remains active.
 - **Recovery is refused for an active process group:** wait for or stop the exact prior installer child process, then re-run the operation. The confirmation flag cannot override a live known process group.
 - **`doctor` reports drift:** inspect the reported integration or user-owned setting. The installer deliberately refuses destructive takeover.
@@ -223,3 +238,7 @@ The Codex plugin can also be checked with the validator bundled with a local Cod
 python3 "$HOME/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py" \
   plugins/codex-claude-bridge
 ```
+
+## Distribution scope
+
+The current distribution is a source-checkout installation for macOS. It can be cloned and installed by another user who meets the requirements, but the package is intentionally marked private and is not prepared for publication to npm. Repository visibility and source-code reuse rights are separate concerns; add an explicit open-source license before presenting the project as generally reusable software.

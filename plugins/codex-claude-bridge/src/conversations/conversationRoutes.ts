@@ -26,9 +26,14 @@ import {
   type SecureBridgeStateContext,
 } from "../registry/secureStateFilesystem.js";
 import {
+  normalizeConversationIdentifier,
   projectIdentitySchema,
   resolveConversationDirectory,
 } from "../runtime/paths.js";
+
+const canonicalUuidSchema = uuidSchema.transform((identifier) =>
+  identifier.toLowerCase(),
+);
 
 const canonicalTimestampSchema = z
   .string()
@@ -38,7 +43,7 @@ const canonicalTimestampSchema = z
 const codexAddressSchema = z
   .object({
     runtime: z.literal("codex"),
-    sessionId: uuidSchema,
+    sessionId: canonicalUuidSchema,
     projectId: projectIdentitySchema,
   })
   .strict();
@@ -46,7 +51,7 @@ const codexAddressSchema = z
 const claudeAddressSchema = z
   .object({
     runtime: z.literal("claude"),
-    sessionId: uuidSchema,
+    sessionId: canonicalUuidSchema,
     projectId: projectIdentitySchema,
   })
   .strict();
@@ -63,8 +68,8 @@ const routeEndpointsSchema = z
 const conversationRouteSchema = routeEndpointsSchema
   .extend({
     schemaVersion: z.literal(1),
-    conversationId: uuidSchema,
-    generationId: uuidSchema,
+    conversationId: canonicalUuidSchema,
+    generationId: canonicalUuidSchema,
     expiresAt: canonicalTimestampSchema,
   })
   .strict();
@@ -100,7 +105,7 @@ const conversationRouteReservationSchema = z
 
 const conversationRouteReservationConditionSchema = z
   .object({
-    expectedGenerationId: uuidSchema,
+    expectedGenerationId: canonicalUuidSchema,
     requiredReplyCapability: z.enum(["codex", "claude"]),
   })
   .strict();
@@ -166,6 +171,7 @@ const lockAcquisitionTimeoutSeconds = 4;
 const maximumOptimisticMutationAttempts = 8;
 const maximumConversationRouteRecords = 256;
 const maximumLivenessChecksPerPrune = 16;
+const maximumRouteMutationsPerLock = 16;
 
 function addressesMatch(firstAddress: AgentAddress, secondAddress: AgentAddress): boolean {
   return (
@@ -211,24 +217,33 @@ async function acquireConversationLock(fileDescriptor: number): Promise<void> {
   }
 }
 
-async function withConversationStoreMutationLock<Result>(
+async function createConversationMutationContext(
   stateHomeDirectory: string | undefined,
-  operation: (context: ConversationMutationContext) => Promise<Result>,
-): Promise<Result> {
+): Promise<ConversationMutationContext> {
   const bridgeStateContext = await prepareSecureBridgeState(stateHomeDirectory);
   const conversationDirectory = await ensurePrivateBridgeDirectory(
     bridgeStateContext,
     resolveConversationDirectory(stateHomeDirectory),
     true,
   );
+  return { bridgeStateContext, conversationDirectory };
+}
+
+async function withConversationStoreMutationLock<Result>(
+  stateHomeDirectory: string | undefined,
+  operation: (context: ConversationMutationContext) => Promise<Result>,
+): Promise<Result> {
+  const conversationMutationContext = await createConversationMutationContext(
+    stateHomeDirectory,
+  );
   const lockFile = await openOrCreatePrivateRegularFile(
-    bridgeStateContext,
-    join(conversationDirectory, ".mutation.lock"),
+    conversationMutationContext.bridgeStateContext,
+    join(conversationMutationContext.conversationDirectory, ".mutation.lock"),
   );
   let operationFailed = false;
   try {
     await acquireConversationLock(lockFile.fileHandle.fd);
-    return await operation({ bridgeStateContext, conversationDirectory });
+    return await operation(conversationMutationContext);
   } catch (error) {
     operationFailed = true;
     throw error;
@@ -248,9 +263,11 @@ function conversationIdentifierFromRecordName(
     return undefined;
   }
   const conversationIdentifier = recordName.slice(0, -".json".length);
-  return uuidSchema.safeParse(conversationIdentifier).success
-    ? conversationIdentifier
-    : undefined;
+  try {
+    return normalizeConversationIdentifier(conversationIdentifier);
+  } catch {
+    return undefined;
+  }
 }
 
 async function listConversationIdentifiers(
@@ -277,7 +294,10 @@ function routeRecordPath(
   conversationDirectory: string,
   conversationIdentifier: string,
 ): string {
-  return join(conversationDirectory, `${uuidSchema.parse(conversationIdentifier)}.json`);
+  return join(
+    conversationDirectory,
+    `${normalizeConversationIdentifier(conversationIdentifier)}.json`,
+  );
 }
 
 async function readConversationRoute(
@@ -306,10 +326,14 @@ async function readConversationRoute(
     }
     const serializedRoute = await openedRecord.fileHandle.readFile("utf8");
     try {
-      return {
-        exists: true,
-        route: conversationRouteSchema.parse(JSON.parse(serializedRoute)),
-      };
+      const route = conversationRouteSchema.parse(JSON.parse(serializedRoute));
+      if (
+        route.conversationId !==
+        normalizeConversationIdentifier(conversationIdentifier)
+      ) {
+        return { exists: true };
+      }
+      return { exists: true, route };
     } catch {
       return { exists: true };
     }
@@ -323,7 +347,7 @@ async function writeConversationRoute(
   conversationIdentifier: string,
   route: ConversationRoute,
 ): Promise<void> {
-  const validatedConversationIdentifier = uuidSchema.parse(
+  const validatedConversationIdentifier = normalizeConversationIdentifier(
     conversationIdentifier,
   );
   if (route.conversationId !== validatedConversationIdentifier) {
@@ -457,26 +481,55 @@ export function createConversationRouteStore(
       (context) => readValidConversationRoute(context, conversationIdentifier),
     );
 
-  const snapshotConversationRoutes = () =>
-    withConversationStoreMutationLock(
+  const snapshotConversationRoutes = async (): Promise<ConversationRoute[]> => {
+    const conversationIdentifiers = await withConversationStoreMutationLock(
       options.stateHomeDirectory,
-      async (context) => {
-        const conversationIdentifiers = await listConversationIdentifiers(
-          context.conversationDirectory,
-        );
-        const routes: ConversationRoute[] = [];
-        for (const conversationIdentifier of conversationIdentifiers) {
-          const route = await readValidConversationRoute(
-            context,
-            conversationIdentifier,
-          );
-          if (route !== undefined) {
-            routes.push(route);
-          }
-        }
-        return routes;
-      },
+      (context) => listConversationIdentifiers(context.conversationDirectory),
     );
+    const snapshotContext = await createConversationMutationContext(
+      options.stateHomeDirectory,
+    );
+    const routes: ConversationRoute[] = [];
+    const invalidConversationIdentifiers: string[] = [];
+    for (const conversationIdentifier of conversationIdentifiers) {
+      const storedRoute = await readConversationRoute(
+        snapshotContext,
+        conversationIdentifier,
+      );
+      if (storedRoute.route !== undefined) {
+        routes.push(storedRoute.route);
+      } else if (storedRoute.exists) {
+        invalidConversationIdentifiers.push(conversationIdentifier);
+      }
+    }
+    if (invalidConversationIdentifiers.length > 0) {
+      for (
+        let batchStartIndex = 0;
+        batchStartIndex < invalidConversationIdentifiers.length;
+        batchStartIndex += maximumRouteMutationsPerLock
+      ) {
+        const conversationIdentifierBatch = invalidConversationIdentifiers.slice(
+          batchStartIndex,
+          batchStartIndex + maximumRouteMutationsPerLock,
+        );
+        await withConversationStoreMutationLock(
+          options.stateHomeDirectory,
+          async (context) => {
+            for (const conversationIdentifier of conversationIdentifierBatch) {
+              const currentRoute = await readConversationRoute(
+                context,
+                conversationIdentifier,
+              );
+              if (currentRoute.exists && currentRoute.route === undefined) {
+                await removeRoute(context, conversationIdentifier);
+              }
+            }
+          },
+        );
+      }
+    }
+    return routes;
+  };
 
   const pruneConversationRoutes = async (
     excludedConversationIdentifier: string,
@@ -517,27 +570,37 @@ export function createConversationRouteStore(
     if (staleRouteSnapshots.length === 0) {
       return;
     }
-    await withConversationStoreMutationLock(
-      options.stateHomeDirectory,
-      async (context) => {
-        for (const staleRouteSnapshot of staleRouteSnapshots) {
-          const currentRoute = await readValidConversationRoute(
-            context,
-            staleRouteSnapshot.conversationId,
-          );
-          if (
-            currentRoute?.generationId === staleRouteSnapshot.generationId
-          ) {
-            await removeRoute(context, staleRouteSnapshot.conversationId);
+    for (
+      let batchStartIndex = 0;
+      batchStartIndex < staleRouteSnapshots.length;
+      batchStartIndex += maximumRouteMutationsPerLock
+    ) {
+      const staleRouteBatch = staleRouteSnapshots.slice(
+        batchStartIndex,
+        batchStartIndex + maximumRouteMutationsPerLock,
+      );
+      await withConversationStoreMutationLock(
+        options.stateHomeDirectory,
+        async (context) => {
+          for (const staleRouteSnapshot of staleRouteBatch) {
+            const currentRoute = await readValidConversationRoute(
+              context,
+              staleRouteSnapshot.conversationId,
+            );
+            if (
+              currentRoute?.generationId === staleRouteSnapshot.generationId
+            ) {
+              await removeRoute(context, staleRouteSnapshot.conversationId);
+            }
           }
-        }
-      },
-    );
+        },
+      );
+    }
   };
 
   return {
     async reserve(conversationIdentifier, inputEndpoints, inputCondition) {
-      const validatedConversationIdentifier = uuidSchema.parse(
+      const validatedConversationIdentifier = normalizeConversationIdentifier(
         conversationIdentifier,
       );
       const endpoints = routeEndpointsSchema.parse(inputEndpoints);
@@ -555,26 +618,46 @@ export function createConversationRouteStore(
         const snapshot = await readRouteSnapshot(validatedConversationIdentifier);
         const snapshotIsActive =
           snapshot !== undefined && (await routeIsActive(snapshot));
+        let activeSnapshot = snapshotIsActive ? snapshot : undefined;
+        if (snapshot !== undefined && !snapshotIsActive) {
+          const staleSnapshotWasRemoved = await withConversationStoreMutationLock(
+            options.stateHomeDirectory,
+            async (context) => {
+              const currentRoute = await readValidConversationRoute(
+                context,
+                validatedConversationIdentifier,
+              );
+              if (!routeGenerationMatches(snapshot, currentRoute)) {
+                return false;
+              }
+              await removeRoute(context, validatedConversationIdentifier);
+              return true;
+            },
+          );
+          if (!staleSnapshotWasRemoved) {
+            continue;
+          }
+          activeSnapshot = undefined;
+        }
         if (
           condition !== undefined &&
-          (!snapshotIsActive ||
-            snapshot?.generationId !== condition.expectedGenerationId ||
+          (activeSnapshot === undefined ||
+            activeSnapshot.generationId !== condition.expectedGenerationId ||
             (condition.requiredReplyCapability === "codex"
-              ? !snapshot.codexCanReply
-              : !snapshot.claudeCanReply))
+              ? !activeSnapshot.codexCanReply
+              : !activeSnapshot.claudeCanReply))
         ) {
           throw new Error("Conversation reply authorization is no longer active");
         }
         if (
-          snapshotIsActive &&
-          snapshot !== undefined &&
-          !endpointsMatch(snapshot, endpoints)
+          activeSnapshot !== undefined &&
+          !endpointsMatch(activeSnapshot, endpoints)
         ) {
           const collisionIsCurrent = await withConversationStoreMutationLock(
             options.stateHomeDirectory,
             async (context) =>
               routeGenerationMatches(
-                snapshot,
+                activeSnapshot,
                 await readValidConversationRoute(
                   context,
                   validatedConversationIdentifier,
@@ -602,7 +685,7 @@ export function createConversationRouteStore(
               context,
               validatedConversationIdentifier,
             );
-            if (!routeGenerationMatches(snapshot, currentRoute)) {
+            if (!routeGenerationMatches(activeSnapshot, currentRoute)) {
               return undefined;
             }
             if (
@@ -626,7 +709,9 @@ export function createConversationRouteStore(
             if (!Number.isFinite(now.getTime())) {
               throw new Error("Current date is invalid");
             }
-            const generationIdentifier = uuidSchema.parse(randomIdentifier());
+            const generationIdentifier = canonicalUuidSchema.parse(
+              randomIdentifier(),
+            );
             if (generationIdentifier === currentRoute?.generationId) {
               throw new Error("Conversation route generation must be unique");
             }
@@ -646,8 +731,8 @@ export function createConversationRouteStore(
             );
             return conversationRouteReservationSchema.parse({
               route,
-              ...(snapshotIsActive && snapshot !== undefined
-                ? { previousRoute: snapshot }
+              ...(activeSnapshot !== undefined
+                ? { previousRoute: activeSnapshot }
                 : {}),
             });
           },
@@ -659,7 +744,7 @@ export function createConversationRouteStore(
       throw new Error("Conversation route changed too many times");
     },
     async findActive(conversationIdentifier) {
-      const validatedConversationIdentifier = uuidSchema.parse(
+      const validatedConversationIdentifier = normalizeConversationIdentifier(
         conversationIdentifier,
       );
       await pruneConversationRoutes(validatedConversationIdentifier);
@@ -701,11 +786,10 @@ export function createConversationRouteStore(
         inputReservation,
       );
       const validatedConversationIdentifier = reservation.route.conversationId;
-      await pruneConversationRoutes(validatedConversationIdentifier);
       const previousRouteIsActive =
         reservation.previousRoute !== undefined &&
         (await routeIsActive(reservation.previousRoute));
-      return withConversationStoreMutationLock(
+      const rollbackResult = await withConversationStoreMutationLock(
         options.stateHomeDirectory,
         async (context) => {
           const storedRoute = await readConversationRoute(
@@ -735,6 +819,10 @@ export function createConversationRouteStore(
           return true;
         },
       );
+      void pruneConversationRoutes(validatedConversationIdentifier).catch(
+        () => undefined,
+      );
+      return rollbackResult;
     },
   };
 }

@@ -50,10 +50,14 @@ function validateProjectIdentity(projectIdentity: string): void {
   projectIdentitySchema.parse(projectIdentity);
 }
 
-function validateConversationIdentifier(conversationIdentifier: string): void {
-  if (!uuidSchema.safeParse(conversationIdentifier).success) {
+export function normalizeConversationIdentifier(
+  conversationIdentifier: string,
+): string {
+  const validationResult = uuidSchema.safeParse(conversationIdentifier);
+  if (!validationResult.success) {
     throw new TypeError("Conversation identifier must be a UUID");
   }
+  return validationResult.data.toLowerCase();
 }
 
 export function resolveBridgeStateDirectory(stateHomeDirectory?: string): string {
@@ -85,9 +89,11 @@ export function resolveConversationRecordPath(
   stateHomeDirectory: string | undefined,
   conversationIdentifier: string,
 ): string {
-  validateConversationIdentifier(conversationIdentifier);
+  const normalizedConversationIdentifier = normalizeConversationIdentifier(
+    conversationIdentifier,
+  );
   return resolveContainedDirectory(
     resolveConversationDirectory(stateHomeDirectory),
-    `${conversationIdentifier}.json`,
+    `${normalizedConversationIdentifier}.json`,
   );
 }

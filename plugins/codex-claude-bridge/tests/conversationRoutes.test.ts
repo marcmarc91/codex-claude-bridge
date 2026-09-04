@@ -117,6 +117,34 @@ test("persists one globally indexed private route and reads it while both endpoi
   assert.equal(JSON.parse(await readFile(recordPath, "utf8")).conversationId, conversationIdentifier);
 });
 
+test("normalizes uppercase conversation identifiers at public and path boundaries", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  const uppercaseConversationIdentifier = conversationIdentifier.toUpperCase();
+  const routeStore = createConversationRouteStore({
+    stateHomeDirectory,
+    randomIdentifier: () => firstGenerationIdentifier,
+    isAddressActive: async () => true,
+  });
+
+  const reservation = await routeStore.reserve(
+    uppercaseConversationIdentifier,
+    endpoints,
+  );
+
+  assert.equal(reservation.route.conversationId, conversationIdentifier);
+  assert.equal(
+    resolveConversationRecordPath(
+      stateHomeDirectory,
+      uppercaseConversationIdentifier,
+    ),
+    resolveConversationRecordPath(stateHomeDirectory, conversationIdentifier),
+  );
+  assert.deepEqual(
+    await routeStore.findActive(conversationIdentifier),
+    reservation.route,
+  );
+});
+
 test("uses one persistent global mutation lock for every conversation", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const routeStore = createConversationRouteStore({
@@ -252,6 +280,105 @@ test("rolls back only the generation owned by the failed send", async (testConte
     true,
   );
   assert.equal(await routeStore.findActive(conversationIdentifier), undefined);
+});
+
+test("rolls back its target before unrelated pruning liveness fails", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  let failUnrelatedLiveness = false;
+  const unrelatedEndpoints: ConversationRouteEndpoints = {
+    ...endpoints,
+    claude: {
+      ...endpoints.claude,
+      sessionId: thirdGenerationIdentifier,
+    },
+  };
+  const routeStore = createConversationRouteStore({
+    stateHomeDirectory,
+    randomIdentifier: sequenceIdentifierFactory(
+      firstGenerationIdentifier,
+      secondGenerationIdentifier,
+    ),
+    isAddressActive: async (address) => {
+      if (
+        failUnrelatedLiveness &&
+        address.sessionId === unrelatedEndpoints.claude.sessionId
+      ) {
+        throw new Error("Unrelated liveness failed");
+      }
+      return true;
+    },
+  });
+  const failedReservation = await routeStore.reserve(
+    conversationIdentifier,
+    endpoints,
+  );
+  await routeStore.reserve(secondConversationIdentifier, unrelatedEndpoints);
+  failUnrelatedLiveness = true;
+
+  assert.equal(await routeStore.rollback(failedReservation), true);
+  await assert.rejects(
+    lstat(resolveConversationRecordPath(stateHomeDirectory, conversationIdentifier)),
+    { code: "ENOENT" },
+  );
+  assert.equal(
+    (
+      await lstat(
+        resolveConversationRecordPath(
+          stateHomeDirectory,
+          secondConversationIdentifier,
+        ),
+      )
+    ).isFile(),
+    true,
+  );
+});
+
+test("returns rollback without waiting for unrelated pruning liveness", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  let blockUnrelatedLiveness = false;
+  let releaseUnrelatedLiveness: (() => void) | undefined;
+  const unrelatedLivenessGate = new Promise<void>((resolveLiveness) => {
+    releaseUnrelatedLiveness = resolveLiveness;
+  });
+  const unrelatedEndpoints: ConversationRouteEndpoints = {
+    ...endpoints,
+    claude: {
+      ...endpoints.claude,
+      sessionId: thirdGenerationIdentifier,
+    },
+  };
+  const routeStore = createConversationRouteStore({
+    stateHomeDirectory,
+    randomIdentifier: sequenceIdentifierFactory(
+      firstGenerationIdentifier,
+      secondGenerationIdentifier,
+    ),
+    isAddressActive: async (address) => {
+      if (
+        blockUnrelatedLiveness &&
+        address.sessionId === unrelatedEndpoints.claude.sessionId
+      ) {
+        await unrelatedLivenessGate;
+      }
+      return true;
+    },
+  });
+  const failedReservation = await routeStore.reserve(
+    conversationIdentifier,
+    endpoints,
+  );
+  await routeStore.reserve(secondConversationIdentifier, unrelatedEndpoints);
+  blockUnrelatedLiveness = true;
+
+  const pendingRollback = routeStore.rollback(failedReservation);
+  const rollbackCompletedIndependently = await settlesBeforeDeadline(
+    pendingRollback,
+    2_000,
+  );
+  releaseUnrelatedLiveness?.();
+  assert.equal(await pendingRollback, true);
+
+  assert.equal(rollbackCompletedIndependently, true);
 });
 
 test("serializes concurrent reservations and permits only one endpoint owner", async (testContext) => {
@@ -839,6 +966,70 @@ test("deletes expired and inactive routes before returning or replacing them", a
   await assert.rejects(
     routeStore.reserve(conversationIdentifier, endpoints),
     /Both conversation endpoints must be active/u,
+  );
+});
+
+test("removes a stale target before rejecting offline replacement endpoints", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  let currentTimeMilliseconds = Date.parse("2026-09-04T10:00:00.000Z");
+  let endpointsAreActive = true;
+  const routeStore = createConversationRouteStore({
+    stateHomeDirectory,
+    timeToLiveMilliseconds: 100,
+    currentDate: () => new Date(currentTimeMilliseconds),
+    randomIdentifier: sequenceIdentifierFactory(
+      firstGenerationIdentifier,
+      secondGenerationIdentifier,
+    ),
+    isAddressActive: async () => endpointsAreActive,
+  });
+  await routeStore.reserve(conversationIdentifier, endpoints);
+  currentTimeMilliseconds += 101;
+  endpointsAreActive = false;
+
+  await assert.rejects(
+    routeStore.reserve(conversationIdentifier, endpoints),
+    /Both conversation endpoints must be active/u,
+  );
+  await assert.rejects(
+    lstat(resolveConversationRecordPath(stateHomeDirectory, conversationIdentifier)),
+    { code: "ENOENT" },
+  );
+});
+
+test("removes a filename and payload conversation mismatch without touching the payload route", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  const routeStore = createConversationRouteStore({
+    stateHomeDirectory,
+    randomIdentifier: sequenceIdentifierFactory(
+      firstGenerationIdentifier,
+      secondGenerationIdentifier,
+    ),
+    isAddressActive: async () => true,
+  });
+  await routeStore.reserve(conversationIdentifier, endpoints);
+  const payloadRoute = (
+    await routeStore.reserve(secondConversationIdentifier, endpoints)
+  ).route;
+  const mismatchedRecordPath = resolveConversationRecordPath(
+    stateHomeDirectory,
+    conversationIdentifier,
+  );
+  const payloadRecordPath = resolveConversationRecordPath(
+    stateHomeDirectory,
+    secondConversationIdentifier,
+  );
+  await writeFile(
+    mismatchedRecordPath,
+    await readFile(payloadRecordPath, "utf8"),
+    "utf8",
+  );
+
+  assert.equal(await routeStore.findActive(conversationIdentifier), undefined);
+  await assert.rejects(lstat(mismatchedRecordPath), { code: "ENOENT" });
+  assert.deepEqual(
+    await routeStore.findActive(secondConversationIdentifier),
+    payloadRoute,
   );
 });
 

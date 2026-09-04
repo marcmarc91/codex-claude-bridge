@@ -277,3 +277,41 @@ test("comenzile manifestului rulează dintr-un cache fără dependențe și păs
     [],
   );
 });
+
+test("hook-ul nu înregistrează sesiunile deținute de Claude Code", async (testContext) => {
+  const stateHomeDirectory = await mkdtemp(join(tmpdir(), "codex-claude-bridge-"));
+  const originalStateHomeDirectory = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = stateHomeDirectory;
+  testContext.after(async () => {
+    if (originalStateHomeDirectory === undefined) {
+      delete process.env.XDG_STATE_HOME;
+    } else {
+      process.env.XDG_STATE_HOME = originalStateHomeDirectory;
+    }
+    await rm(stateHomeDirectory, { recursive: true, force: true });
+  });
+
+  const claudeSessionIdentifier = "7b2f8c31-4d5a-4e6b-9c0d-1a2b3c4d5e6f";
+  const workingDirectory = process.cwd();
+  const projectIdentifier = await resolveProjectIdentity(workingDirectory);
+  const sessionStartInput = {
+    hook_event_name: "SessionStart",
+    session_id: claudeSessionIdentifier,
+    cwd: workingDirectory,
+  };
+
+  await runCodexSessionHook(sessionStartInput, async (parentProcessIdentifier) => ({
+    pid: parentProcessIdentifier,
+    sessionId: claudeSessionIdentifier,
+    name: "claude-session",
+    cwd: workingDirectory,
+  }));
+  assert.deepEqual(await listActiveSessions({ projectId: projectIdentifier }), []);
+
+  await runCodexSessionHook(sessionStartInput, async () => {
+    throw new Error("metadata indisponibilă");
+  });
+  const registeredSessions = await listActiveSessions({ projectId: projectIdentifier });
+  assert.equal(registeredSessions.length, 1);
+  assert.equal(registeredSessions[0]?.runtime, "codex");
+});

@@ -1,11 +1,24 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
+
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 import {
   runCommandLine,
@@ -18,7 +31,11 @@ import type {
   ConversationRouteStore,
 } from "../src/conversations/conversationRoutes.js";
 import { createConversationRouteStore } from "../src/conversations/conversationRoutes.js";
-import type { ActiveSessionRecord } from "../src/registry/activeSessionRegistry.js";
+import {
+  listActiveSessions,
+  type ActiveSessionRecord,
+} from "../src/registry/activeSessionRegistry.js";
+import { resolveProjectIdentity } from "../src/registry/projectIdentity.js";
 
 const executeFile = promisify(execFile);
 const packageDirectory = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -30,6 +47,29 @@ const remoteClaudeSessionIdentifier = "ea7220bc-cd1e-41f0-bf7f-413982f18a9c";
 const conversationIdentifier = "5cb1e2fd-5b24-4699-bfea-878e9b147370";
 const messageIdentifier = "3c4b3c10-21a7-4d6f-b964-3c816b9ed8db";
 const generationIdentifier = "d2f86dee-55db-4a12-9a98-04bc3df54687";
+
+interface ClaudePluginManifest {
+  mcpServers: Record<
+    string,
+    {
+      command: string;
+      args: string[];
+    }
+  >;
+}
+
+async function waitForCondition(
+  condition: () => Promise<boolean>,
+  failureMessage: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (await condition()) {
+      return;
+    }
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 10));
+  }
+  throw new Error(failureMessage);
+}
 
 function activeSession(
   runtime: "codex" | "claude",
@@ -688,6 +728,119 @@ test("builds and executes the package bin entrypoint against an isolated empty s
   assert.deepEqual(JSON.parse(stdout), { sessions: [] });
 });
 
+test("starts and cleans up the exact Claude MCP manifest command through a global bin", async (testContext) => {
+  const temporaryDirectory = await mkdtemp("/tmp/ccb-mcp-command-");
+  const homeDirectory = join(temporaryDirectory, "home");
+  const stateHomeDirectory = join(temporaryDirectory, "state");
+  const cachedPluginDirectory = join(temporaryDirectory, "plugin-cache");
+  const cachedManifestDirectory = join(cachedPluginDirectory, ".claude-plugin");
+  const temporaryBinaryDirectory = join(temporaryDirectory, "bin");
+  const sourceManifestPath = join(
+    packageDirectory,
+    ".claude-plugin",
+    "plugin.json",
+  );
+  const cachedManifestPath = join(cachedManifestDirectory, "plugin.json");
+  const claudeSessionsDirectory = join(homeDirectory, ".claude", "sessions");
+  let client: Client | undefined;
+  testContext.after(async () => {
+    await client?.close().catch(() => undefined);
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+
+  await Promise.all([
+    mkdir(cachedManifestDirectory, { recursive: true }),
+    mkdir(temporaryBinaryDirectory, { recursive: true }),
+    mkdir(claudeSessionsDirectory, { recursive: true }),
+  ]);
+  await copyFile(sourceManifestPath, cachedManifestPath);
+  await assert.rejects(access(join(cachedPluginDirectory, "node_modules")), {
+    code: "ENOENT",
+  });
+  await executeFile(process.execPath, [
+    join(packageDirectory, "node_modules", "typescript", "bin", "tsc"),
+    "-p",
+    join(packageDirectory, "tsconfig.json"),
+  ]);
+  const compiledBridgePath = join(
+    packageDirectory,
+    "dist",
+    "bin",
+    "codexClaudeBridge.js",
+  );
+  await chmod(compiledBridgePath, 0o700);
+  await symlink(
+    compiledBridgePath,
+    join(temporaryBinaryDirectory, "codex-claude-bridge"),
+  );
+
+  const sessionIdentifier = "01994b35-1234-7abc-8def-0123456789ab";
+  await writeFile(
+    join(claudeSessionsDirectory, `${process.pid}.json`),
+    `${JSON.stringify({
+      pid: process.pid,
+      sessionId: sessionIdentifier,
+      name: "manifest-smoke-test",
+      cwd: packageDirectory,
+    })}\n`,
+    { mode: 0o600 },
+  );
+
+  const manifest = JSON.parse(
+    await readFile(cachedManifestPath, "utf8"),
+  ) as ClaudePluginManifest;
+  const serverConfiguration = manifest.mcpServers["codex-claude-bridge"];
+  assert.ok(serverConfiguration);
+  let standardError = "";
+  const transport = new StdioClientTransport({
+    command: serverConfiguration.command,
+    args: serverConfiguration.args,
+    cwd: cachedPluginDirectory,
+    env: {
+      HOME: homeDirectory,
+      PATH: `${temporaryBinaryDirectory}:${dirname(process.execPath)}:/usr/bin:/bin`,
+      XDG_STATE_HOME: stateHomeDirectory,
+      CLAUDE_PLUGIN_ROOT: cachedPluginDirectory,
+    },
+    stderr: "pipe",
+  });
+  transport.stderr?.on("data", (chunk) => {
+    standardError += String(chunk);
+  });
+  client = new Client(
+    { name: "manifest-smoke-client", version: "1.0.0" },
+    { capabilities: {} },
+  );
+  await client.connect(transport);
+  assert.equal((await client.listTools()).tools.length, 3);
+
+  const projectIdentifier = await resolveProjectIdentity(packageDirectory);
+  let registeredSession: ActiveSessionRecord | undefined;
+  await waitForCondition(async () => {
+    [registeredSession] = await listActiveSessions(
+      { runtime: "claude", projectId: projectIdentifier },
+      stateHomeDirectory,
+    );
+    return registeredSession !== undefined;
+  }, `Claude MCP manifest command did not register its session: ${standardError}`);
+  assert.equal(registeredSession?.sessionId, sessionIdentifier);
+  assert.equal(registeredSession?.processId, process.pid);
+  assert.ok(registeredSession?.socketPath);
+  const socketPath = registeredSession.socketPath;
+
+  await client.close();
+  client = undefined;
+  await waitForCondition(async () => {
+    const sessions = await listActiveSessions(
+      { runtime: "claude", projectId: projectIdentifier },
+      stateHomeDirectory,
+    );
+    return sessions.length === 0;
+  }, "Claude MCP manifest command did not remove its session");
+  await assert.rejects(access(socketPath), { code: "ENOENT" });
+  assert.equal(standardError, "");
+});
+
 test("keeps Claude MCP inline and leaves no root MCP configuration discoverable by Codex", async () => {
   const claudeManifest = JSON.parse(
     await readFile(join(packageDirectory, ".claude-plugin", "plugin.json"), "utf8"),
@@ -703,13 +856,14 @@ test("keeps Claude MCP inline and leaves no root MCP configuration discoverable 
   await assert.rejects(access(join(packageDirectory, ".mcp.json")), { code: "ENOENT" });
   assert.deepEqual(claudeManifest.mcpServers, {
     "codex-claude-bridge": {
-      command: "node",
-      args: [
-        "${CLAUDE_PLUGIN_ROOT}/dist/bin/codexClaudeBridge.js",
-        "claude-channel",
-      ],
+      command: "codex-claude-bridge",
+      args: ["claude-channel"],
     },
   });
+  assert.equal(
+    JSON.stringify(claudeManifest.mcpServers).includes("CLAUDE_PLUGIN_ROOT"),
+    false,
+  );
   assert.equal(codexManifest.skills, "./skills/");
   assert.equal(Object.hasOwn(codexManifest, "mcpServers"), false);
   assert.equal(Object.hasOwn(codexManifest, "hooks"), false);

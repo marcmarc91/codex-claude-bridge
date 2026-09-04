@@ -93,6 +93,7 @@ interface ResolvedInstallerContext {
   pluginRoot: string;
   homeDirectory: string;
   stateHomeDirectory: string | undefined;
+  environmentPath: string;
   vscodeSettingsPath: string;
   executables: InstallerExecutables;
   executeCommand: (
@@ -200,6 +201,7 @@ async function resolveInstallerContext(
     pluginRoot,
     homeDirectory,
     stateHomeDirectory: options.stateHomeDirectory,
+    environmentPath,
     vscodeSettingsPath:
       options.vscodeSettingsPath ??
       join(homeDirectory, "Library", "Application Support", "Code", "User", "settings.json"),
@@ -777,6 +779,23 @@ async function assertReceiptStillInstalled(
   ) {
     throw new Error("Installed bridge state drifted from its receipt");
   }
+  await assertGlobalBridgeCommandIsResolvable(context, receipt.npm.binPaths[0]);
+}
+
+async function assertGlobalBridgeCommandIsResolvable(
+  context: ResolvedInstallerContext,
+  expectedExecutablePath: string,
+): Promise<void> {
+  const resolvedExecutablePath = await resolvePathExecutable(
+    pluginName,
+    context.environmentPath,
+  );
+  if (
+    resolvedExecutablePath === undefined ||
+    !(await pathResolvesTo(resolvedExecutablePath, expectedExecutablePath))
+  ) {
+    throw new Error("Global bridge command is not resolvable from PATH");
+  }
 }
 
 async function validateReceiptProvenance(
@@ -1011,6 +1030,10 @@ export async function installBridgeGlobally(
             receipt.npm.binPaths[1],
             join(receipt.pluginRoot, "dist", "bin", "claudeCodeBridgeWrapper.js"),
           )),
+      );
+      await assertGlobalBridgeCommandIsResolvable(
+        context,
+        receipt.npm.binPaths[0],
       );
       await performOwnedStep(
         stateContext,

@@ -1,6 +1,6 @@
 {
   "name": "codex-claude-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local active-session message bridge between Claude Code and Codex.",
   "author": {
     "name": "Codex-Claude Bridge Maintainers"
@@ -12,9 +12,8 @@
   ],
   "mcpServers": {
     "codex-claude-bridge": {
-      "command": "node",
+      "command": "codex-claude-bridge",
       "args": [
-        "${CLAUDE_PLUGIN_ROOT}/dist/bin/codexClaudeBridge.js",
         "claude-channel"
       ]
     }

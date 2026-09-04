@@ -65,8 +65,12 @@ async function createTestOptions(testContext: test.TestContext): Promise<{
   await mkdir(join(pluginRoot, "dist", "bin"), { recursive: true });
   await writeFile(join(pluginRoot, "node_modules", "typescript", "bin", "tsc"), "build");
   await writeFile(join(pluginRoot, "tsconfig.json"), "{}\n");
-  await writeFile(join(pluginRoot, "dist", "bin", "codexClaudeBridge.js"), "bridge");
-  await writeFile(join(pluginRoot, "dist", "bin", "claudeCodeBridgeWrapper.js"), "wrapper");
+  await writeFile(join(pluginRoot, "dist", "bin", "codexClaudeBridge.js"), "bridge", {
+    mode: 0o700,
+  });
+  await writeFile(join(pluginRoot, "dist", "bin", "claudeCodeBridgeWrapper.js"), "wrapper", {
+    mode: 0o700,
+  });
   await mkdir(dirname(settingsPath), { recursive: true });
   await writeFile(settingsPath, '{\n  // keep\n  "editor.fontSize": 14,\n}\n');
   await chmod(settingsPath, 0o640);
@@ -265,6 +269,7 @@ async function createTestOptions(testContext: test.TestContext): Promise<{
       repositoryRoot,
       homeDirectory,
       stateHomeDirectory,
+      environmentPath: binDirectory,
       vscodeSettingsPath: settingsPath,
       executables: {
         node: process.execPath,
@@ -341,6 +346,21 @@ test("installs in the documented order, writes a private receipt, and is idempot
     ).length,
     mutationCountAfterFirstInstall,
   );
+});
+
+test("rolls back installation when the global bridge command is unavailable through PATH", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+
+  await assert.rejects(
+    installBridgeGlobally({ ...fixture.options, environmentPath: "" }),
+    /Global bridge command is not resolvable from PATH/u,
+  );
+
+  assert.equal(fixture.state.npmLinked, false);
+  assert.equal(fixture.state.codexMarketplaceSource, undefined);
+  assert.equal(fixture.state.codexPluginInstalled, false);
+  assert.equal(fixture.state.claudeMarketplaceSource, undefined);
+  assert.equal(fixture.state.claudePluginInstalled, false);
 });
 
 test("uninstalls owned resources in reverse order, restores settings through CAS, and unlinks npm last", async (testContext) => {
@@ -804,6 +824,24 @@ test("doctor accepts supported integrations and reports no active sessions as in
   assert.match(
     report.checks.find(({ name }) => name === "codex_hook_trust")?.message ?? "",
     /0\.153\.1/u,
+  );
+});
+
+test("doctor reports a global bridge command that is unavailable through PATH", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  await installBridgeGlobally(fixture.options);
+
+  const report = await doctorBridgeInstallation({
+    ...fixture.options,
+    environmentPath: "",
+  });
+
+  assert.equal(report.ok, false);
+  const integrationsCheck = report.checks.find(({ name }) => name === "integrations");
+  assert.equal(integrationsCheck?.status, "failed");
+  assert.match(
+    integrationsCheck?.message ?? "",
+    /Global bridge command is not resolvable from PATH/u,
   );
 });
 

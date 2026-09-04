@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { realpath } from "node:fs/promises";
 import { constants } from "node:os";
+import { delimiter, dirname, isAbsolute } from "node:path";
 
 export const bridgeChannelSelector =
   "plugin:codex-claude-bridge@codex-claude-bridge-local";
@@ -26,7 +27,7 @@ export interface ClaudeProcessWrapperDependencies {
   spawnProcess: (
     executablePath: string,
     argumentsList: string[],
-    options: { shell: false; stdio: "inherit" },
+    options: { shell: false; stdio: "inherit"; env: NodeJS.ProcessEnv },
   ) => SpawnedClaudeProcess;
   addSignalHandler: (
     signal: NodeJS.Signals,
@@ -38,6 +39,7 @@ export interface ClaudeProcessWrapperDependencies {
   ) => void;
   signalHandlers: Map<NodeJS.Signals, () => void>;
   wrapperExecutablePath?: string;
+  processEnvironment?: NodeJS.ProcessEnv;
   resolveExecutableIdentity?: (executablePath: string) => Promise<string>;
 }
 
@@ -77,6 +79,29 @@ function signalExitCode(signal: NodeJS.Signals | null): number {
   return 128 + constants.signals[signal];
 }
 
+function buildClaudeProcessEnvironment(
+  processEnvironment: NodeJS.ProcessEnv,
+  wrapperExecutablePath: string | undefined,
+): NodeJS.ProcessEnv {
+  if (
+    wrapperExecutablePath === undefined ||
+    !isAbsolute(wrapperExecutablePath)
+  ) {
+    return { ...processEnvironment };
+  }
+  const globalBinaryDirectory = dirname(wrapperExecutablePath);
+  const remainingPathDirectories = (processEnvironment.PATH ?? "")
+    .split(delimiter)
+    .filter(
+      (pathDirectory) =>
+        pathDirectory.length > 0 && pathDirectory !== globalBinaryDirectory,
+    );
+  return {
+    ...processEnvironment,
+    PATH: [globalBinaryDirectory, ...remainingPathDirectories].join(delimiter),
+  };
+}
+
 function createDefaultDependencies(): ClaudeProcessWrapperDependencies {
   return {
     spawnProcess: (executablePath, argumentsList, options) =>
@@ -85,6 +110,7 @@ function createDefaultDependencies(): ClaudeProcessWrapperDependencies {
     removeSignalHandler: (signal, handler) => process.off(signal, handler),
     signalHandlers: new Map(),
     wrapperExecutablePath: process.argv[1],
+    processEnvironment: process.env,
     resolveExecutableIdentity: realpath,
   };
 }
@@ -112,7 +138,14 @@ export async function runClaudeProcessWrapper(
   const claudeProcess = dependencies.spawnProcess(
     claudeExecutablePath,
     buildClaudeProcessArguments(originalArguments),
-    { shell: false, stdio: "inherit" },
+    {
+      shell: false,
+      stdio: "inherit",
+      env: buildClaudeProcessEnvironment(
+        dependencies.processEnvironment ?? process.env,
+        wrapperExecutablePath,
+      ),
+    },
   );
   for (const signal of forwardedSignals) {
     const handler = (): void => {

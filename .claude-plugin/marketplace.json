@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Local active-session bridge for Codex and Claude Code.",
-    "version": "0.1.0"
+    "version": "0.1.1"
   },
   "plugins": [
     {
       "name": "codex-claude-bridge",
       "description": "Local active-session bridge for Codex and Claude Code.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "author": {
         "name": "Codex-Claude Bridge Maintainers"
       },

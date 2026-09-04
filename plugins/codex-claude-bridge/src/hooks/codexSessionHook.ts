@@ -3,6 +3,10 @@ import { pathToFileURL } from "node:url";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 
+import {
+  readOwningClaudeSessionMetadata,
+  type ClaudeSessionMetadata,
+} from "../channel/claudeSessionMetadata.js";
 import { registerActiveSession, unregisterActiveSession } from "../registry/activeSessionRegistry.js";
 import { resolveProjectIdentity } from "../registry/projectIdentity.js";
 import { uuidSchema } from "../protocol/messageEnvelope.js";
@@ -26,9 +30,39 @@ function parseCodexSessionHookInput(input: unknown): CodexSessionHookInput | und
   return parsedInput.success ? parsedInput.data : undefined;
 }
 
-export async function runCodexSessionHook(input: unknown): Promise<void> {
+export type OwningClaudeSessionReader = (
+  parentProcessIdentifier: number,
+) => Promise<ClaudeSessionMetadata>;
+
+async function hookInvocationBelongsToClaudeCodeSession(
+  sessionId: string,
+  parentProcessIdentifier: number,
+  readOwningClaudeSession: OwningClaudeSessionReader,
+): Promise<boolean> {
+  try {
+    const owningClaudeSession = await readOwningClaudeSession(parentProcessIdentifier);
+    return owningClaudeSession.sessionId === sessionId;
+  } catch {
+    return false;
+  }
+}
+
+export async function runCodexSessionHook(
+  input: unknown,
+  readOwningClaudeSession: OwningClaudeSessionReader = readOwningClaudeSessionMetadata,
+): Promise<void> {
   const hookInput = parseCodexSessionHookInput(input);
   if (hookInput === undefined) {
+    return;
+  }
+
+  if (
+    await hookInvocationBelongsToClaudeCodeSession(
+      hookInput.session_id,
+      process.ppid,
+      readOwningClaudeSession,
+    )
+  ) {
     return;
   }
 

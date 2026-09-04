@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { access, lstat, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 export interface InstallerExecutables {
   node: string;
@@ -16,7 +16,7 @@ export async function resolvePathExecutable(
   environmentPath: string,
 ): Promise<string | undefined> {
   for (const pathDirectory of environmentPath.split(":")) {
-    if (pathDirectory.length === 0) {
+    if (!isAbsolute(pathDirectory)) {
       continue;
     }
     const candidatePath = join(pathDirectory, executableName);

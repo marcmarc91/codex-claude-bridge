@@ -29,7 +29,7 @@ function createWrapperDependencies(
   capturedSpawn: {
     executablePath?: string;
     arguments?: string[];
-    options?: { shell?: boolean; stdio?: string };
+    options?: { shell?: boolean; stdio?: string; env?: NodeJS.ProcessEnv };
   },
 ): ClaudeProcessWrapperDependencies {
   const signalHandlers = new Map<NodeJS.Signals, () => void>();
@@ -140,7 +140,34 @@ test("spawns the supplied Claude executable without a shell and returns its exit
     "--resume",
     "session-id",
   ]);
-  assert.deepEqual(capturedSpawn.options, { shell: false, stdio: "inherit" });
+  assert.equal(capturedSpawn.options?.shell, false);
+  assert.equal(capturedSpawn.options?.stdio, "inherit");
+});
+
+test("prepends the global bridge bin directory to the Claude process PATH", async () => {
+  const fakeClaudeProcess = new FakeClaudeProcess();
+  const capturedSpawn: Parameters<typeof createWrapperDependencies>[1] = {};
+  const dependencies = Object.assign(
+    createWrapperDependencies(fakeClaudeProcess, capturedSpawn),
+    {
+      wrapperExecutablePath: "/global/bin/claude-code-bridge-wrapper",
+      processEnvironment: {
+        PATH: "/usr/bin:/bin",
+        PRESERVED_VALUE: "present",
+      },
+    },
+  );
+  const resultPromise = runClaudeProcessWrapper(
+    ["/usr/bin/claude"],
+    dependencies,
+  );
+
+  await waitForSpawn();
+  fakeClaudeProcess.emit("close", 0, null);
+
+  assert.equal(await resultPromise, 0);
+  assert.equal(capturedSpawn.options?.env?.PATH, "/global/bin:/usr/bin:/bin");
+  assert.equal(capturedSpawn.options?.env?.PRESERVED_VALUE, "present");
 });
 
 test("forwards termination signals exactly once and removes handlers after exit", async () => {

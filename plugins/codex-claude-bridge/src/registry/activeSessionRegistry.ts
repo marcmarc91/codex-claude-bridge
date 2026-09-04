@@ -124,7 +124,7 @@ function pathIsContained(parentDirectory: string, candidatePath: string): boolea
   );
 }
 
-function parseStoredActiveSessionRecord(
+export function parseStoredActiveSessionRecord(
   input: unknown,
   stateHomeDirectory?: string,
   canonicalBridgeStateDirectory?: string,

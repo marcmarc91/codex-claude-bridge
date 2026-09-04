@@ -129,6 +129,9 @@ function createDependencies(
     }),
     runCodexSessionHookFromStandardInput: async () => undefined,
     startClaudeChannelServer: async () => undefined,
+    installBridgeGlobally: async () => undefined,
+    uninstallBridgeGlobally: async () => undefined,
+    doctorBridgeInstallation: async () => ({ ok: true, checks: [] }),
     ...overrides,
   };
 }
@@ -394,6 +397,60 @@ test("accepts message content beginning with dashes and describes human output a
   assert.match(result.stdout, /Transport accepted/u);
   assert.match(result.stdout, /transport acknowledgement only/u);
   assert.doesNotMatch(result.stdout, /^Delivered/u);
+});
+
+test("routes global install and uninstall commands only with the explicit global flag", async () => {
+  const calls: string[] = [];
+  const dependencies = Object.assign(createDependencies(), {
+    installBridgeGlobally: async (_writeOutput: unknown, confirmPendingCommandStopped: boolean) => {
+      calls.push(`install:${String(confirmPendingCommandStopped)}`);
+    },
+    uninstallBridgeGlobally: async (_writeOutput: unknown, confirmPendingCommandStopped: boolean) => {
+      calls.push(`uninstall:${String(confirmPendingCommandStopped)}`);
+    },
+    doctorBridgeInstallation: async () => ({ ok: true, checks: [] }),
+  });
+
+  assert.equal((await runCommand(["install", "--global"], dependencies)).exitCode, 0);
+  assert.equal(
+    (
+      await runCommand(
+        ["uninstall", "--global", "--confirm-pending-command-stopped"],
+        dependencies,
+      )
+    ).exitCode,
+    0,
+  );
+  assert.deepEqual(calls, ["install:false", "uninstall:true"]);
+  assert.equal((await runCommand(["install"], dependencies)).exitCode, 1);
+  assert.equal((await runCommand(["uninstall", "--project"], dependencies)).exitCode, 1);
+});
+
+test("formats doctor checks and returns non-zero only for required failures", async () => {
+  const informationalDependencies = Object.assign(createDependencies(), {
+    installBridgeGlobally: async () => undefined,
+    uninstallBridgeGlobally: async () => undefined,
+    doctorBridgeInstallation: async () => ({
+      ok: true,
+      checks: [{ name: "active_sessions", status: "info" as const, message: "none active" }],
+    }),
+  });
+  const failingDependencies = Object.assign(createDependencies(), {
+    installBridgeGlobally: async () => undefined,
+    uninstallBridgeGlobally: async () => undefined,
+    doctorBridgeInstallation: async () => ({
+      ok: false,
+      checks: [{ name: "claude_version", status: "failed" as const, message: "too old" }],
+    }),
+  });
+
+  const informationalResult = await runCommand(["doctor", "--json"], informationalDependencies);
+  const failingResult = await runCommand(["doctor"], failingDependencies);
+
+  assert.equal(informationalResult.exitCode, 0);
+  assert.equal(JSON.parse(informationalResult.stdout).checks[0].status, "info");
+  assert.equal(failingResult.exitCode, 1);
+  assert.match(failingResult.stdout, /FAILED\tclaude_version\ttoo old/u);
 });
 
 test("reverses a persisted route for a correlated reply", async () => {

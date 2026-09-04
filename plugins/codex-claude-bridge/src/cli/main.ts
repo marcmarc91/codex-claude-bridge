@@ -15,6 +15,12 @@ import {
 } from "../conversations/conversationRoutes.js";
 import { runCodexSessionHookFromStandardInput } from "../hooks/codexSessionHook.js";
 import {
+  doctorBridgeInstallation,
+  installBridgeGlobally,
+  uninstallBridgeGlobally,
+  type DoctorReport,
+} from "../install/globalInstaller.js";
+import {
   AgentRuntime,
   parseAgentMessageEnvelope,
   uuidSchema,
@@ -42,6 +48,15 @@ export interface CommandLineDependencies {
   ) => ReturnType<typeof deliverClaudeMessage>;
   runCodexSessionHookFromStandardInput: () => Promise<void>;
   startClaudeChannelServer: () => Promise<unknown>;
+  installBridgeGlobally: (
+    writeOutput: (value: string) => void,
+    confirmPendingCommandStopped: boolean,
+  ) => Promise<void>;
+  uninstallBridgeGlobally: (
+    writeOutput: (value: string) => void,
+    confirmPendingCommandStopped: boolean,
+  ) => Promise<void>;
+  doctorBridgeInstallation: () => Promise<DoctorReport>;
   stateHomeDirectory?: string;
 }
 
@@ -406,7 +421,31 @@ function createDefaultDependencies(): CommandLineDependencies {
     deliverClaudeMessage,
     runCodexSessionHookFromStandardInput,
     startClaudeChannelServer,
+    installBridgeGlobally: (writeOutput, confirmPendingCommandStopped) =>
+      installBridgeGlobally({ writeOutput, confirmPendingCommandStopped }),
+    uninstallBridgeGlobally: (writeOutput, confirmPendingCommandStopped) =>
+      uninstallBridgeGlobally({ writeOutput, confirmPendingCommandStopped }),
+    doctorBridgeInstallation: () => doctorBridgeInstallation(),
   };
+}
+
+function writeDoctorReport(
+  report: DoctorReport,
+  useJson: boolean,
+  writeOutput: (value: string) => void,
+): void {
+  if (useJson) {
+    writeOutput(`${JSON.stringify(report)}\n`);
+    return;
+  }
+  writeOutput(
+    `${report.checks
+      .map(
+        (check) =>
+          `${check.status.toUpperCase()}\t${check.name}\t${check.message}`,
+      )
+      .join("\n")}\n`,
+  );
 }
 
 export async function runCommandLine(options: RunCommandLineOptions): Promise<number> {
@@ -433,6 +472,38 @@ export async function runCommandLine(options: RunCommandLineOptions): Promise<nu
         parseOptions(commandArguments, {});
         await dependencies.startClaudeChannelServer();
         break;
+      case "install":
+        {
+          const installOptions = parseOptions(commandArguments, {
+            "--global": { takesValue: false, required: true },
+            "--confirm-pending-command-stopped": { takesValue: false },
+          });
+          await dependencies.installBridgeGlobally(
+            writeOutput,
+            installOptions["--confirm-pending-command-stopped"] === true,
+          );
+        }
+        break;
+      case "uninstall":
+        {
+          const uninstallOptions = parseOptions(commandArguments, {
+            "--global": { takesValue: false, required: true },
+            "--confirm-pending-command-stopped": { takesValue: false },
+          });
+          await dependencies.uninstallBridgeGlobally(
+            writeOutput,
+            uninstallOptions["--confirm-pending-command-stopped"] === true,
+          );
+        }
+        break;
+      case "doctor": {
+        const doctorOptions = parseOptions(commandArguments, {
+          "--json": { takesValue: false },
+        });
+        const report = await dependencies.doctorBridgeInstallation();
+        writeDoctorReport(report, doctorOptions["--json"] === true, writeOutput);
+        return report.ok ? 0 : 1;
+      }
       default:
         throw new TypeError(
           command === undefined ? "Missing command" : `Unknown command: ${command}`,

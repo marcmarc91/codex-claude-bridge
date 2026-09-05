@@ -166,3 +166,32 @@ test("rejects a relative configured Claude directory", async (testContext) => {
     ),
   );
 });
+
+test("canonicalizes symlink components in the configured Claude directory", async (testContext) => {
+  const homeDirectory = await createClaudeHome(testContext);
+  const configurationParent = await realpath(
+    await mkdtemp(join(tmpdir(), "ccb-claude-config-")),
+  );
+  testContext.after(() => rm(configurationParent, { recursive: true, force: true }));
+  const canonicalClaudeDirectory = join(configurationParent, ".claude-work");
+  await mkdir(join(canonicalClaudeDirectory, "sessions"), {
+    recursive: true,
+    mode: 0o700,
+  });
+  await writeFile(
+    join(canonicalClaudeDirectory, "sessions", `${owningProcessIdentifier}.json`),
+    JSON.stringify(representativeClaudeMetadataInput()),
+    { mode: 0o600 },
+  );
+  const symlinkParent = join(configurationParent, "link");
+  await symlink(configurationParent, symlinkParent);
+
+  assert.deepEqual(
+    await readOwningClaudeSessionMetadata(
+      owningProcessIdentifier,
+      homeDirectory,
+      join(symlinkParent, ".claude-work"),
+    ),
+    expectedOwningMetadata(),
+  );
+});

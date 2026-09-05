@@ -56,7 +56,7 @@ async function resolveClaudeDirectory(
   configuredDirectory: string | undefined,
 ): Promise<string> {
   if (configuredDirectory !== undefined && configuredDirectory.trim().length > 0) {
-    return validateConfiguredClaudeDirectory(configuredDirectory);
+    return realpath(validateConfiguredClaudeDirectory(configuredDirectory));
   }
 
   return join(await realpath(validateHomeDirectory(homeDirectory)), ".claude");

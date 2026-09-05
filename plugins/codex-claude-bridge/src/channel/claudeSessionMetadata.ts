@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 
 import { uuidSchema } from "../protocol/messageEnvelope.js";
@@ -43,6 +43,25 @@ function validateHomeDirectory(homeDirectory: string): string {
   return resolve(homeDirectory);
 }
 
+function validateConfiguredClaudeDirectory(configuredDirectory: string): string {
+  if (!isAbsolute(configuredDirectory) || configuredDirectory.includes("\0")) {
+    throw new TypeError("Claude configuration directory must be an absolute path");
+  }
+
+  return resolve(configuredDirectory);
+}
+
+async function resolveClaudeDirectory(
+  homeDirectory: string,
+  configuredDirectory: string | undefined,
+): Promise<string> {
+  if (configuredDirectory !== undefined && configuredDirectory.trim().length > 0) {
+    return validateConfiguredClaudeDirectory(configuredDirectory);
+  }
+
+  return join(await realpath(validateHomeDirectory(homeDirectory)), ".claude");
+}
+
 async function verifyMetadataDirectory(directoryPath: string): Promise<void> {
   const directoryStatus = await lstat(directoryPath);
   if (
@@ -60,14 +79,17 @@ async function verifyMetadataDirectory(directoryPath: string): Promise<void> {
 export async function readOwningClaudeSessionMetadata(
   parentProcessIdentifier: number,
   homeDirectory = homedir(),
+  configuredClaudeDirectory = process.env.CLAUDE_CONFIG_DIR,
 ): Promise<ClaudeSessionMetadata> {
   const validatedProcessIdentifier = validateParentProcessIdentifier(
     parentProcessIdentifier,
   );
-  const validatedHomeDirectory = await realpath(validateHomeDirectory(homeDirectory));
-  const claudeDirectory = join(validatedHomeDirectory, ".claude");
+  const claudeDirectory = await resolveClaudeDirectory(
+    homeDirectory,
+    configuredClaudeDirectory,
+  );
   const sessionsDirectory = join(claudeDirectory, "sessions");
-  await verifyMetadataDirectory(validatedHomeDirectory);
+  await verifyMetadataDirectory(dirname(claudeDirectory));
   await verifyMetadataDirectory(claudeDirectory);
   await verifyMetadataDirectory(sessionsDirectory);
 

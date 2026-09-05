@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import { readOwningClaudeSessionMetadata } from "../src/channel/claudeSessionMetadata.js";
+
+delete process.env.CLAUDE_CONFIG_DIR;
 
 const owningProcessIdentifier = 43127;
 
@@ -124,4 +126,43 @@ test("rejects invalid owning process identifiers before filesystem access", asyn
       readOwningClaudeSessionMetadata(invalidProcessIdentifier, "/missing"),
     );
   }
+});
+
+test("prefers the configured Claude directory over the home directory", async (testContext) => {
+  const homeDirectory = await createClaudeHome(testContext);
+  const configurationParent = await realpath(
+    await mkdtemp(join(tmpdir(), "ccb-claude-config-")),
+  );
+  testContext.after(() => rm(configurationParent, { recursive: true, force: true }));
+  const configuredClaudeDirectory = join(configurationParent, ".claude-work");
+  await mkdir(join(configuredClaudeDirectory, "sessions"), {
+    recursive: true,
+    mode: 0o700,
+  });
+  await writeFile(
+    join(configuredClaudeDirectory, "sessions", `${owningProcessIdentifier}.json`),
+    JSON.stringify(representativeClaudeMetadataInput()),
+    { mode: 0o600 },
+  );
+
+  assert.deepEqual(
+    await readOwningClaudeSessionMetadata(
+      owningProcessIdentifier,
+      homeDirectory,
+      configuredClaudeDirectory,
+    ),
+    expectedOwningMetadata(),
+  );
+});
+
+test("rejects a relative configured Claude directory", async (testContext) => {
+  const homeDirectory = await createClaudeHome(testContext);
+
+  await assert.rejects(() =>
+    readOwningClaudeSessionMetadata(
+      owningProcessIdentifier,
+      homeDirectory,
+      "relative/config",
+    ),
+  );
 });

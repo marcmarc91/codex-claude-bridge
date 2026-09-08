@@ -203,3 +203,21 @@ test("un script node din pachetul @openai/codex este identificat drept 'codex'",
 
   assert.equal(runtime, "codex");
 });
+
+test("un director de proiect numit codex sau un pachet cu prefix asemănător nu este dovadă de host codex", async () => {
+  for (const commandLine of [
+    "node /tmp/codex/helper.js",
+    "node /tmp/@openai/codex-not-runtime/tool.js",
+  ]) {
+    const runtime = await identifyHookHostRuntime(
+      { sessionId, parentProcessIdentifier },
+      {
+        readOwningClaudeSession: failingOwningClaudeSessionReader,
+        readParentProcessCommandLine: async () => commandLine,
+        environment: {},
+      },
+    );
+
+    assert.equal(runtime, "unknown", commandLine);
+  }
+});

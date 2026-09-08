@@ -115,11 +115,16 @@ function identifyRuntimeFromParentProcessCommandLine(commandLine: string | undef
   if (scriptSegments.includes("claude-code")) {
     return "claude";
   }
-  const scriptPath = scriptToken ?? "";
-  if (scriptPath.includes("@openai/codex") || scriptSegments.includes("codex")) {
+  if (segmentsContainPackagePath(scriptSegments, ["@openai", "codex"])) {
     return "codex";
   }
   return undefined;
+}
+
+function segmentsContainPackagePath(segments: string[], packagePath: string[]): boolean {
+  return segments.some((_, index) =>
+    packagePath.every((packageSegment, offset) => segments[index + offset] === packageSegment),
+  );
 }
 
 async function identifyRuntimeFromOwningClaudeSession(

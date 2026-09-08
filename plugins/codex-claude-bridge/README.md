@@ -31,9 +31,14 @@ There is no permission tool and no broadcast fallback. Claude-to-Codex delivery 
 
 ```text
 codex-claude-bridge sessions [--runtime claude|codex] [--project <path>] [--json]
-codex-claude-bridge send --from <session> --to <session> --type <message|question|handoff> --message <text> [--json]
-codex-claude-bridge reply --conversation <uuid> --message <text> [--json]
+codex-claude-bridge send --from <session> --to <session> --type <message|question|handoff> --message <text> [--wait-minutes <minutes>] [--json]
+codex-claude-bridge reply --conversation <uuid> --message <text> [--reply-to <message-id>] [--json]
+codex-claude-bridge ack --message <message-id> [--from <session>] [--json]
+codex-claude-bridge status --message <message-id> [--json]
+codex-claude-bridge clean [--json]
 codex-claude-bridge doctor [--json]
+codex-claude-bridge setup [--no-vscode] [--vscode-settings <path>] [--confirm-pending-command-stopped]
+codex-claude-bridge launch claude|codex [--] [args...]
 codex-claude-bridge install --global [--confirm-pending-command-stopped]
 codex-claude-bridge uninstall --global [--confirm-pending-command-stopped]
 ```
@@ -45,6 +50,8 @@ The Codex hook and Claude MCP manifests invoke `codex-claude-bridge` from `PATH`
 Messages use strict UUID-based envelopes, canonical UTC timestamps, explicit sender and recipient addresses, and at most 65,536 UTF-8 bytes of content. Unknown envelope fields are rejected. Replies retain the conversation UUID and reverse the route.
 
 A successful send or reply initially confirms transport acceptance only. Persistent receipts separately track explicit agent acknowledgement and correlated replies. See [delivery and timeout semantics](../../docs/delivery-and-timeouts.md). A reply is not evidence that the requested work passed verification.
+
+For `send --wait-minutes`, exits are `0` for the requested receipt, `1` for a missing receipt or command/storage error, `2` for an elapsed wait, and `3` for `receipt_lock_timeout`. A post-delivery `receipt_warning` or `wait_error` does not prove non-delivery; retain the message ID and inspect status before considering another send. JSON wait output is one buffered document. `clean` mutates orphaned state explicitly; it is not part of `doctor` or `setup`.
 
 ## Runtime boundary
 

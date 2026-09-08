@@ -143,6 +143,7 @@ Reply to a correlated inbound message:
 ```bash
 codex-claude-bridge reply \
   --conversation <conversation-uuid> \
+  --reply-to <inbound-message-uuid> \
   --message "The requested work is complete."
 ```
 
@@ -157,7 +158,13 @@ codex-claude-bridge status --message <message-uuid>
 
 Use the message UUID, not the conversation UUID. Add `--wait-minutes 5` to `send` to keep that invocation waiting: questions and handoffs wait for a correlated reply; informational messages wait for an explicit acknowledgement. A seen-but-unreplied question still reaches the reply deadline. Without a waiting invocation, no CLI background monitor remains running.
 
-`CODEX_CLAUDE_BRIDGE_TIMEOUT_MINUTES` sets the default receipt deadline in minutes (default `5`). See [delivery and timeout semantics](docs/delivery-and-timeouts.md) for diagnostics, retention, and recovery limits.
+`--reply-to` correlates the reply to one inbound message. Without it, an ambiguous conversation can receive a reply without any original message being marked `replied`. `ack` and `status` also accept `--json`; `ack --from <codex-session>` explicitly selects the receiving session.
+
+`CODEX_CLAUDE_BRIDGE_TIMEOUT_MINUTES` sets the stored receipt deadline in minutes (default `5`). `--wait-minutes` controls only how long this CLI invocation waits; it does not change that stored deadline. Both accept 0.01–1440 minutes.
+
+For `send --wait-minutes`, exit codes are `0` for the expected acknowledgement/reply, `1` for a missing receipt or command/storage error, `2` for an elapsed wait with diagnosis, and `3` for receipt-lock contention through the deadline (`receipt_lock_timeout`). `status` returns `0` when a receipt exists, even if overdue, and `1` when it is missing.
+
+After transport acceptance, `receipt_warning` means receipt persistence failed, not delivery. A later wait error returns exit `1` with `wait_error`, preserving `delivered` and `message_id`. Do not resend solely because of either field. Human output confirms transport before waiting; `--json` buffers one document until the wait finishes or errors. See [delivery and timeout semantics](docs/delivery-and-timeouts.md) for the complete contract.
 
 Inspect the installation:
 
@@ -167,6 +174,14 @@ codex-claude-bridge doctor --json
 ```
 
 No active sessions is informational. Missing requirements, unsafe state permissions, receipt drift, or integration drift make `doctor` exit non-zero.
+
+`doctor` inspects overdue receipts without creating or changing their store. Cleanup is a separate, explicit operation:
+
+```bash
+codex-claude-bridge clean --json
+```
+
+This removes eligible orphaned bridge sockets and dead-process registrations, reporting skipped paths and reasons. It does not delete persistent lock files or restart agents. Prefer running it after stopping bridge sessions: concurrent registration and the final socket check/removal are not one atomic operation.
 
 ## Live round-trip check
 

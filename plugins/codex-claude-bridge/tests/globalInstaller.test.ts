@@ -2671,3 +2671,19 @@ test("doctor keeps receipt inspection failures informational", async (testContex
   assert.match(overdueCheck?.message ?? "", /receipt store is locked/u);
   assert.equal(report.ok, true);
 });
+
+test("doctor inspects overdue receipts without creating the messages directory", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  await installBridgeGlobally(fixture.options);
+  const messagesDirectory = join(fixture.stateHomeDirectory, "codex-claude-bridge", "messages");
+  assert.equal(existsSync(messagesDirectory), false);
+
+  const report = await doctorBridgeInstallation({
+    ...fixture.options,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  });
+
+  assert.equal(report.checks.find(({ name }) => name === "overdue_messages")?.status, "info");
+  assert.equal(existsSync(messagesDirectory), false);
+});

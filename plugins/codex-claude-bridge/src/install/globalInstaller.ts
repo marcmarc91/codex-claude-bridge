@@ -5,7 +5,7 @@ import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  createMessageStatusStore,
+  listOverdueReadOnly,
   type MessageStatusRecord,
 } from "../conversations/messageStatusStore.js";
 import type { ActiveSessionRecord } from "../registry/activeSessionRegistry.js";
@@ -1698,10 +1698,7 @@ async function addOverdueMessagesCheck(
 ): Promise<void> {
   try {
     const overdueMessages = await (options.listOverdueMessages ??
-      (() =>
-        createMessageStatusStore({
-          stateHomeDirectory: context.stateHomeDirectory,
-        }).listOverdue()))();
+      (() => listOverdueReadOnly({ stateHomeDirectory: context.stateHomeDirectory })))();
     checks.push({
       name: "overdue_messages",
       status: "info",

@@ -1646,3 +1646,35 @@ test("cleans orphaned bridge state and reports every skipped path with its reaso
     ].join("\n"),
   );
 });
+
+test("keeps the delivery proof when the wait itself fails", async () => {
+  const failingReaderDependencies = () =>
+    createDependencies({
+      messageStatusStore: createStatusStoreStub({
+        get: async () => {
+          throw new Error("receipt store is corrupt");
+        },
+      }),
+    });
+
+  const jsonResult = await runCommand(
+    [...sendArguments, "--wait-minutes", "1", "--json"],
+    failingReaderDependencies(),
+  );
+  const humanResult = await runCommand(
+    [...sendArguments, "--wait-minutes", "1"],
+    failingReaderDependencies(),
+  );
+
+  assert.equal(jsonResult.exitCode, 1);
+  const payload = JSON.parse(jsonResult.stdout);
+  assert.equal(payload.delivered, true);
+  assert.equal(payload.message_id, messageIdentifier);
+  assert.equal(payload.conversation_id, conversationIdentifier);
+  assert.equal(payload.wait_error, "receipt store is corrupt");
+  assert.equal(payload.outcome, undefined);
+  assert.match(jsonResult.stderr, /receipt store is corrupt/u);
+  assert.equal(humanResult.exitCode, 1);
+  assert.match(humanResult.stdout, new RegExp(`Transport accepted message ${messageIdentifier}`, "u"));
+  assert.match(humanResult.stderr, /receipt store is corrupt/u);
+});

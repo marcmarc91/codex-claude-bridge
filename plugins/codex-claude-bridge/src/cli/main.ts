@@ -400,6 +400,13 @@ function deliveryResultPayload(
   };
 }
 
+function deliveryResultLine(
+  envelope: AgentMessageEnvelope,
+  status: MessageStatusRecord,
+): string {
+  return `Transport accepted message ${envelope.messageId} in conversation ${envelope.conversationId}; receipt state ${status.state}; transport acknowledgement only.\n`;
+}
+
 function writeDeliveryResult(
   envelope: AgentMessageEnvelope,
   delivery: TrackedDelivery,
@@ -412,9 +419,7 @@ function writeDeliveryResult(
       `${JSON.stringify(deliveryResultPayload(envelope, delivery.status, delivery.receiptWarning))}\n`,
     );
   } else {
-    writeOutput(
-      `Transport accepted message ${envelope.messageId} in conversation ${envelope.conversationId}; receipt state ${delivery.status.state}; transport acknowledgement only.\n`,
-    );
+    writeOutput(deliveryResultLine(envelope, delivery.status));
   }
   if (delivery.receiptWarning !== undefined) {
     writeError(`${delivery.receiptWarning}\n`);
@@ -499,24 +504,44 @@ async function waitForDeliveryReceipt(
   writeOutput: (value: string) => void,
   writeError: (value: string) => void,
 ): Promise<number> {
-  const waitResult = await waitForMessageStatus({
-    store: dependencies.messageStatusStore,
-    messageId: envelope.messageId,
-    waitMinutes,
-    until: envelope.messageType === "message" ? "seen" : "replied",
-    currentDate: dependencies.currentDate,
-    ...(dependencies.stateHomeDirectory === undefined
-      ? {}
-      : { stateHomeDirectory: dependencies.stateHomeDirectory }),
-  });
+  const deliveryPayload = deliveryResultPayload(
+    envelope,
+    delivery.status,
+    delivery.receiptWarning,
+  );
+  if (!useJson) {
+    writeOutput(deliveryResultLine(envelope, delivery.status));
+  }
+  if (delivery.receiptWarning !== undefined) {
+    writeError(`${delivery.receiptWarning}\n`);
+  }
+  let waitResult;
+  try {
+    waitResult = await waitForMessageStatus({
+      store: dependencies.messageStatusStore,
+      messageId: envelope.messageId,
+      waitMinutes,
+      until: envelope.messageType === "message" ? "seen" : "replied",
+      currentDate: dependencies.currentDate,
+      ...(dependencies.stateHomeDirectory === undefined
+        ? {}
+        : { stateHomeDirectory: dependencies.stateHomeDirectory }),
+    });
+  } catch (error) {
+    const waitErrorMessage = describeCommandError(error);
+    if (useJson) {
+      writeOutput(
+        `${JSON.stringify({ ...deliveryPayload, wait_error: waitErrorMessage })}\n`,
+      );
+    }
+    writeError(`${waitErrorMessage}\n`);
+    return 1;
+  }
   if (useJson) {
     writeOutput(
       `${JSON.stringify({
-        ...deliveryResultPayload(
-          envelope,
-          waitResult.status ?? delivery.status,
-          delivery.receiptWarning,
-        ),
+        ...deliveryPayload,
+        status: waitResult.status ?? delivery.status,
         outcome: waitResult.outcome,
         ...(waitResult.reason === undefined ? {} : { reason: waitResult.reason }),
         ...(waitResult.diagnosis === undefined
@@ -528,9 +553,6 @@ async function waitForDeliveryReceipt(
     writeOutput(
       `Message ${envelope.messageId} ended the wait as ${waitResult.outcome}.\n`,
     );
-  }
-  if (delivery.receiptWarning !== undefined) {
-    writeError(`${delivery.receiptWarning}\n`);
   }
   if (waitResult.outcome === "seen" || waitResult.outcome === "replied") {
     return 0;

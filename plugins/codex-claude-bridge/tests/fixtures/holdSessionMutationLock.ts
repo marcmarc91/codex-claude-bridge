@@ -16,6 +16,7 @@ await withSessionMutationLock(
   sessionIdentifier,
   async () => {
     process.send?.("acquired");
+    setInterval(() => undefined, 1_000_000);
     await new Promise(() => undefined);
   },
 );

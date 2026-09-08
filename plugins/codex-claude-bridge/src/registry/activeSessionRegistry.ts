@@ -180,7 +180,7 @@ async function processIsActive(processIdentifier: number): Promise<boolean> {
   }
 }
 
-async function probeUnixSocket(socketPath: string): Promise<boolean> {
+export async function probeUnixSocket(socketPath: string): Promise<boolean> {
   return new Promise((resolveProbe) => {
     const socket = connect(socketPath);
     let probeFinished = false;

@@ -29,6 +29,7 @@ import {
   type CommandExecutionResult,
   type GlobalInstallerOptions,
 } from "../src/install/globalInstaller.js";
+import type { MessageStatusRecord } from "../src/conversations/messageStatusStore.js";
 import type { ActiveSessionRecord } from "../src/registry/activeSessionRegistry.js";
 
 const marketplaceName = "codex-claude-bridge-local";
@@ -2583,4 +2584,90 @@ test("setup ignores an editor directory without settings and rejects a missing e
   );
 
   assert.equal(existsSync(missingSettingsPath), false);
+});
+
+function overdueMessageRecord(messageId: string): MessageStatusRecord {
+  return {
+    messageId,
+    conversationId: "5cb1e2fd-5b24-4699-bfea-878e9b147370",
+    sender: {
+      runtime: "codex",
+      sessionId: "8d6380bf-1b93-44b3-b3da-a1a661cf8b69",
+      projectId: "0123456789abcdef01234567",
+    },
+    recipient: {
+      runtime: "claude",
+      sessionId: "ad65b1c1-7386-4465-80f9-4de0a26bc212",
+      projectId: "0123456789abcdef01234567",
+    },
+    messageType: "question",
+    contentDigest: "0".repeat(64),
+    sentAt: "2026-09-04T10:00:00.000Z",
+    createdAt: "2026-09-04T10:00:00.000Z",
+    expiresAt: "2026-09-05T10:05:00.000Z",
+    deadlineAt: "2026-09-04T10:05:00.000Z",
+    transportState: "accepted",
+    transportAcceptedAt: "2026-09-04T10:00:00.000Z",
+    state: "accepted",
+  };
+}
+
+test("doctor lists overdue receipts without mutating bridge state", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  await installBridgeGlobally(fixture.options);
+  const firstOverdueIdentifier = "6f2b1f9c-4b0e-4a3f-9c1d-2e5a7b8c9d01";
+  const secondOverdueIdentifier = "7a3c2e8d-5c1f-4b2e-ab34-1d2e3f4a5b6c";
+
+  const idleReport = await doctorBridgeInstallation({
+    ...fixture.options,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+    listOverdueMessages: async () => [],
+  });
+  const busyReport = await doctorBridgeInstallation({
+    ...fixture.options,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+    listOverdueMessages: async () => [
+      overdueMessageRecord(firstOverdueIdentifier),
+      overdueMessageRecord(secondOverdueIdentifier),
+    ],
+  });
+
+  const idleOverdueCheck = idleReport.checks.find(({ name }) => name === "overdue_messages");
+  assert.equal(idleOverdueCheck?.status, "info");
+  assert.equal(idleOverdueCheck?.message, "No overdue message receipts");
+  assert.equal(
+    idleReport.checks.find(({ name }) => name === "state_hygiene"),
+    undefined,
+  );
+  const busyOverdueCheck = busyReport.checks.find(({ name }) => name === "overdue_messages");
+  assert.equal(busyOverdueCheck?.status, "info");
+  assert.match(busyOverdueCheck?.message ?? "", /^2 overdue message receipts: /u);
+  assert.match(busyOverdueCheck?.message ?? "", new RegExp(firstOverdueIdentifier, "u"));
+  assert.match(busyOverdueCheck?.message ?? "", new RegExp(secondOverdueIdentifier, "u"));
+  assert.equal(
+    busyReport.checks.find(({ name }) => name === "state_hygiene"),
+    undefined,
+  );
+  assert.equal(busyReport.ok, true);
+});
+
+test("doctor keeps receipt inspection failures informational", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  await installBridgeGlobally(fixture.options);
+
+  const report = await doctorBridgeInstallation({
+    ...fixture.options,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+    listOverdueMessages: async () => {
+      throw new Error("receipt store is locked");
+    },
+  });
+
+  const overdueCheck = report.checks.find(({ name }) => name === "overdue_messages");
+  assert.equal(overdueCheck?.status, "info");
+  assert.match(overdueCheck?.message ?? "", /receipt store is locked/u);
+  assert.equal(report.ok, true);
 });

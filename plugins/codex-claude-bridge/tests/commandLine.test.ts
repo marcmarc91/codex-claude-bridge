@@ -24,13 +24,23 @@ import {
   runCommandLine,
   type CommandLineDependencies,
 } from "../src/cli/main.js";
-import type { DeliverClaudeMessageOptions } from "../src/channel/channelSocketClient.js";
+import {
+  ChannelTransportError,
+  type DeliverClaudeMessageOptions,
+} from "../src/channel/channelSocketClient.js";
 import type {
   ConversationRoute,
   ConversationRouteEndpoints,
   ConversationRouteStore,
 } from "../src/conversations/conversationRoutes.js";
 import { createConversationRouteStore } from "../src/conversations/conversationRoutes.js";
+import {
+  createMessageStatusStore,
+  MessageStatusLockTimeoutError,
+  type MessageStatusRecord,
+  type MessageStatusStore,
+} from "../src/conversations/messageStatusStore.js";
+import type { AgentMessageEnvelope } from "../src/protocol/messageEnvelope.js";
 import {
   listActiveSessions,
   type ActiveSessionRecord,
@@ -47,6 +57,9 @@ const remoteClaudeSessionIdentifier = "ea7220bc-cd1e-41f0-bf7f-413982f18a9c";
 const conversationIdentifier = "5cb1e2fd-5b24-4699-bfea-878e9b147370";
 const messageIdentifier = "3c4b3c10-21a7-4d6f-b964-3c816b9ed8db";
 const generationIdentifier = "d2f86dee-55db-4a12-9a98-04bc3df54687";
+const originalMessageIdentifier = "6f2b1f9c-4b0e-4a3f-9c1d-2e5a7b8c9d01";
+const secondOriginalMessageIdentifier = "7a3c2e8d-5c1f-4b2e-ab34-1d2e3f4a5b6c";
+const otherCodexSessionIdentifier = "9b8c7d6e-1a2b-4c3d-8e9f-0a1b2c3d4e5f";
 
 interface ClaudePluginManifest {
   mcpServers: Record<
@@ -143,6 +156,78 @@ function createMemoryRouteStore(
   };
 }
 
+function createStatusStoreStub(
+  overrides: Partial<MessageStatusStore> = {},
+): MessageStatusStore {
+  const records = new Map<string, MessageStatusRecord>();
+  const mutate = (
+    messageId: string,
+    mutation: (record: MessageStatusRecord) => void,
+  ): MessageStatusRecord => {
+    const record = records.get(messageId);
+    if (record === undefined) {
+      throw new Error("Message status is missing or expired");
+    }
+    mutation(record);
+    return record;
+  };
+  return {
+    async createPending(envelope) {
+      const record: MessageStatusRecord = {
+        messageId: envelope.messageId,
+        conversationId: envelope.conversationId,
+        sender: envelope.sender,
+        recipient: envelope.recipient,
+        messageType: envelope.messageType,
+        contentDigest: "0".repeat(64),
+        sentAt: envelope.sentAt,
+        createdAt: envelope.sentAt,
+        expiresAt: envelope.sentAt,
+        deadlineAt: envelope.sentAt,
+        transportState: "pending",
+        state: "pending",
+      };
+      records.set(record.messageId, record);
+      return record;
+    },
+    async markAccepted(messageId) {
+      return mutate(messageId, (record) => {
+        record.transportState = "accepted";
+        record.transportAcceptedAt = record.sentAt;
+        record.state = "accepted";
+      });
+    },
+    async markTransportFailure(messageId, outcome) {
+      return mutate(messageId, (record) => {
+        record.transportState = outcome;
+      });
+    },
+    async markSeen(messageId) {
+      return mutate(messageId, (record) => {
+        record.acknowledgedAt = record.sentAt;
+        record.state = "seen";
+      });
+    },
+    async markReplied(messageId, _recipient, replyMessageId) {
+      return mutate(messageId, (record) => {
+        record.repliedAt = record.sentAt;
+        record.replyMessageId = replyMessageId;
+        record.state = "replied";
+      });
+    },
+    async get(messageId) {
+      return records.get(messageId);
+    },
+    async findReplyTarget() {
+      return undefined;
+    },
+    async listOverdue() {
+      return [];
+    },
+    ...overrides,
+  };
+}
+
 function createDependencies(
   overrides: Partial<CommandLineDependencies> = {},
 ): CommandLineDependencies {
@@ -163,6 +248,7 @@ function createDependencies(
           (filters.projectId === undefined || session.projectId === filters.projectId),
       ),
     conversationRouteStore: createMemoryRouteStore(),
+    messageStatusStore: createStatusStoreStub(),
     deliverClaudeMessage: async ({ envelope }) => ({
       delivered: true,
       messageId: envelope.messageId,
@@ -172,6 +258,11 @@ function createDependencies(
     installBridgeGlobally: async () => undefined,
     uninstallBridgeGlobally: async () => undefined,
     doctorBridgeInstallation: async () => ({ ok: true, checks: [] }),
+    cleanupBridgeState: async () => ({
+      removedSockets: 0,
+      removedSessionRecords: 0,
+      skipped: [],
+    }),
     setupBridge: async () => ({ ok: true, checks: [] }),
     launchBridgeRuntime: async () => 0,
     ...overrides,
@@ -299,12 +390,14 @@ test("resolves display names only in the source project and stores correlation b
 
   assert.equal(result.exitCode, 0);
   assert.equal(result.stderr, "");
-  assert.deepEqual(JSON.parse(result.stdout), {
+  const { status, ...deliveryResult } = JSON.parse(result.stdout);
+  assert.deepEqual(deliveryResult, {
     delivered: true,
     message_id: messageIdentifier,
     conversation_id: conversationIdentifier,
     acknowledgement: "transport acknowledgement only",
   });
+  assert.equal(status.state, "accepted");
   assert.deepEqual(deliveredOptions[0]?.envelope, {
     schemaVersion: 1,
     messageId: messageIdentifier,
@@ -513,6 +606,10 @@ test("runs setup with optional editor integration and prints the launch next ste
   assert.match(defaultResult.stdout, /INFO\tactive_sessions\tnone active/u);
   assert.match(defaultResult.stdout, /codex-claude-bridge launch claude/u);
   assert.match(defaultResult.stdout, /codex-claude-bridge launch codex/u);
+  assert.match(
+    defaultResult.stdout,
+    /Optional: codex-claude-bridge clean removes sockets left by crashed sessions\./u,
+  );
 });
 
 test("returns a failing setup exit code when the doctor report fails", async () => {
@@ -973,4 +1070,579 @@ test("keeps Claude MCP inline and leaves no root MCP configuration discoverable 
   assert.match(skill, /Never broadcast/u);
   assert.match(skill, /current task scope/u);
   assert.match(skill, /reply --conversation/u);
+});
+
+async function createReceiptStore(
+  testContext: test.TestContext,
+  currentDate: () => Date = () => new Date("2026-09-04T10:00:00.000Z"),
+): Promise<{ stateHomeDirectory: string; store: MessageStatusStore }> {
+  const stateHomeDirectory = await mkdtemp("/private/tmp/ccb-cli-receipts-");
+  testContext.after(() => rm(stateHomeDirectory, { recursive: true, force: true }));
+  return {
+    stateHomeDirectory,
+    store: createMessageStatusStore({ stateHomeDirectory, currentDate }),
+  };
+}
+
+function claudeToCodexEnvelope(
+  messageId: string,
+  content = "please review",
+): AgentMessageEnvelope {
+  return {
+    schemaVersion: 1,
+    messageId,
+    conversationId: conversationIdentifier,
+    sentAt: "2026-09-04T09:59:00.000Z",
+    messageType: "question",
+    sender: {
+      runtime: "claude",
+      sessionId: localClaudeSessionIdentifier,
+      projectId: firstProjectIdentifier,
+    },
+    recipient: {
+      runtime: "codex",
+      sessionId: localCodexSessionIdentifier,
+      projectId: firstProjectIdentifier,
+    },
+    content,
+  };
+}
+
+async function createAcceptedInboundMessage(
+  store: MessageStatusStore,
+  messageId: string,
+  content?: string,
+): Promise<void> {
+  await store.createPending(claudeToCodexEnvelope(messageId, content));
+  await store.markAccepted(messageId);
+}
+
+function codexReplyRoute(): ConversationRoute {
+  return {
+    schemaVersion: 1,
+    conversationId: conversationIdentifier,
+    generationId: generationIdentifier,
+    expiresAt: "2026-09-04T10:15:00.000Z",
+    codex: {
+      runtime: "codex",
+      sessionId: localCodexSessionIdentifier,
+      projectId: firstProjectIdentifier,
+    },
+    claude: {
+      runtime: "claude",
+      sessionId: localClaudeSessionIdentifier,
+      projectId: firstProjectIdentifier,
+    },
+    codexCanReply: true,
+    claudeCanReply: false,
+  };
+}
+
+const sendArguments = [
+  "send",
+  "--from",
+  localCodexSessionIdentifier,
+  "--to",
+  localClaudeSessionIdentifier,
+  "--type",
+  "question",
+  "--message",
+  "status?",
+];
+
+test("creates a pending receipt before delivery and accepts it after transport", async (testContext) => {
+  const { stateHomeDirectory, store } = await createReceiptStore(testContext);
+  let receiptDuringDelivery: MessageStatusRecord | undefined;
+  const dependencies = createDependencies({
+    stateHomeDirectory,
+    messageStatusStore: store,
+    deliverClaudeMessage: async ({ envelope }) => {
+      receiptDuringDelivery = await store.get(envelope.messageId);
+      return { delivered: true, messageId: envelope.messageId };
+    },
+  });
+
+  const result = await runCommand([...sendArguments, "--json"], dependencies);
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(receiptDuringDelivery?.state, "pending");
+  assert.equal(receiptDuringDelivery?.transportState, "pending");
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.message_id, messageIdentifier);
+  assert.equal(payload.status.state, "accepted");
+  assert.equal(payload.status.transportState, "accepted");
+  const storedReceipt = await store.get(messageIdentifier);
+  assert.equal(storedReceipt?.state, "accepted");
+  assert.notEqual(storedReceipt?.transportAcceptedAt, undefined);
+});
+
+test("prints the message identifier and its receipt state in human send output", async (testContext) => {
+  const { stateHomeDirectory, store } = await createReceiptStore(testContext);
+  const dependencies = createDependencies({ stateHomeDirectory, messageStatusStore: store });
+
+  const result = await runCommand(sendArguments, dependencies);
+
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdout, new RegExp(messageIdentifier, "u"));
+  assert.match(result.stdout, /receipt state accepted/u);
+});
+
+test("marks a refused Channel transport as failed and surfaces its code", async (testContext) => {
+  const { stateHomeDirectory, store } = await createReceiptStore(testContext);
+  const dependencies = createDependencies({
+    stateHomeDirectory,
+    messageStatusStore: store,
+    deliverClaudeMessage: async () => {
+      throw new ChannelTransportError("ECONNREFUSED", "Claude Channel connection refused");
+    },
+  });
+
+  const result = await runCommand(sendArguments, dependencies);
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /Claude Channel connection refused \(ECONNREFUSED\)/u);
+  const storedReceipt = await store.get(messageIdentifier);
+  assert.equal(storedReceipt?.transportState, "failed");
+  assert.equal(storedReceipt?.state, "pending");
+});
+
+test("leaves a timed out Channel transport unknown instead of failed", async (testContext) => {
+  const { stateHomeDirectory, store } = await createReceiptStore(testContext);
+  const dependencies = createDependencies({
+    stateHomeDirectory,
+    messageStatusStore: store,
+    deliverClaudeMessage: async () => {
+      throw new ChannelTransportError("TIMEOUT", "Channel delivery timed out; delivery status is unknown");
+    },
+  });
+
+  const result = await runCommand(sendArguments, dependencies);
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /\(TIMEOUT\)/u);
+  assert.equal((await store.get(messageIdentifier))?.transportState, "unknown");
+});
+
+test("correlates a Codex reply with the only unanswered inbound message", async (testContext) => {
+  const { stateHomeDirectory, store } = await createReceiptStore(testContext);
+  await createAcceptedInboundMessage(store, originalMessageIdentifier);
+  let deliveredEnvelope: AgentMessageEnvelope | undefined;
+  const dependencies = createDependencies({
+    stateHomeDirectory,
+    messageStatusStore: store,
+    randomIdentifier: () => messageIdentifier,
+    conversationRouteStore: createMemoryRouteStore([codexReplyRoute()]),
+    deliverClaudeMessage: async ({ envelope }) => {
+      deliveredEnvelope = envelope;
+      return { delivered: true, messageId: envelope.messageId };
+    },
+  });
+
+  const result = await runCommand(
+    ["reply", "--conversation", conversationIdentifier, "--message", "done"],
+    dependencies,
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(deliveredEnvelope?.replyToMessageId, originalMessageIdentifier);
+  const original = await store.get(originalMessageIdentifier);
+  assert.equal(original?.state, "replied");
+  assert.equal(original?.replyMessageId, messageIdentifier);
+  assert.notEqual(original?.repliedAt, undefined);
+});
+
+test("correlates an explicit reply target and leaves ambiguous conversations uncorrelated", async (testContext) => {
+  const explicitFixture = await createReceiptStore(testContext);
+  await createAcceptedInboundMessage(explicitFixture.store, originalMessageIdentifier, "first");
+  await createAcceptedInboundMessage(
+    explicitFixture.store,
+    secondOriginalMessageIdentifier,
+    "second",
+  );
+  let explicitEnvelope: AgentMessageEnvelope | undefined;
+  const explicitDependencies = createDependencies({
+    stateHomeDirectory: explicitFixture.stateHomeDirectory,
+    messageStatusStore: explicitFixture.store,
+    randomIdentifier: () => messageIdentifier,
+    conversationRouteStore: createMemoryRouteStore([codexReplyRoute()]),
+    deliverClaudeMessage: async ({ envelope }) => {
+      explicitEnvelope = envelope;
+      return { delivered: true, messageId: envelope.messageId };
+    },
+  });
+  const ambiguousFixture = await createReceiptStore(testContext);
+  await createAcceptedInboundMessage(ambiguousFixture.store, originalMessageIdentifier, "first");
+  await createAcceptedInboundMessage(
+    ambiguousFixture.store,
+    secondOriginalMessageIdentifier,
+    "second",
+  );
+  let ambiguousEnvelope: AgentMessageEnvelope | undefined;
+  const ambiguousDependencies = createDependencies({
+    stateHomeDirectory: ambiguousFixture.stateHomeDirectory,
+    messageStatusStore: ambiguousFixture.store,
+    randomIdentifier: () => messageIdentifier,
+    conversationRouteStore: createMemoryRouteStore([codexReplyRoute()]),
+    deliverClaudeMessage: async ({ envelope }) => {
+      ambiguousEnvelope = envelope;
+      return { delivered: true, messageId: envelope.messageId };
+    },
+  });
+
+  const explicitResult = await runCommand(
+    [
+      "reply",
+      "--conversation",
+      conversationIdentifier,
+      "--message",
+      "done",
+      "--reply-to",
+      secondOriginalMessageIdentifier,
+    ],
+    explicitDependencies,
+  );
+  const ambiguousResult = await runCommand(
+    ["reply", "--conversation", conversationIdentifier, "--message", "done"],
+    ambiguousDependencies,
+  );
+  const unknownTargetResult = await runCommand(
+    [
+      "reply",
+      "--conversation",
+      conversationIdentifier,
+      "--message",
+      "done",
+      "--reply-to",
+      remoteClaudeSessionIdentifier,
+    ],
+    createDependencies({
+      stateHomeDirectory: explicitFixture.stateHomeDirectory,
+      messageStatusStore: explicitFixture.store,
+      randomIdentifier: () => messageIdentifier,
+      conversationRouteStore: createMemoryRouteStore([codexReplyRoute()]),
+    }),
+  );
+
+  assert.equal(explicitResult.exitCode, 0);
+  assert.equal(explicitEnvelope?.replyToMessageId, secondOriginalMessageIdentifier);
+  assert.equal(
+    (await explicitFixture.store.get(secondOriginalMessageIdentifier))?.state,
+    "replied",
+  );
+  assert.equal(
+    (await explicitFixture.store.get(originalMessageIdentifier))?.state,
+    "accepted",
+  );
+  assert.equal(ambiguousResult.exitCode, 0);
+  assert.equal(ambiguousEnvelope?.replyToMessageId, undefined);
+  assert.equal(
+    (await ambiguousFixture.store.get(originalMessageIdentifier))?.state,
+    "accepted",
+  );
+  assert.equal(unknownTargetResult.exitCode, 1);
+  assert.match(unknownTargetResult.stderr, /is not an unanswered message/u);
+});
+
+test("acknowledges an inbound message once for its receiving Codex session", async (testContext) => {
+  let acknowledgementTimestamp = Date.parse("2026-09-04T10:00:00.000Z");
+  const { stateHomeDirectory, store } = await createReceiptStore(testContext, () => {
+    acknowledgementTimestamp += 60_000;
+    return new Date(acknowledgementTimestamp);
+  });
+  await createAcceptedInboundMessage(store, originalMessageIdentifier);
+  const otherCodexSession = activeSession(
+    "codex",
+    otherCodexSessionIdentifier,
+    "codex-other",
+  );
+  const sessions = [
+    localCodexSession,
+    otherCodexSession,
+    localClaudeSession,
+    remoteClaudeSession,
+  ];
+  const dependencies = createDependencies({
+    stateHomeDirectory,
+    messageStatusStore: store,
+    listActiveSessions: async (filters = {}) =>
+      sessions.filter(
+        (session) =>
+          (filters.runtime === undefined || session.runtime === filters.runtime) &&
+          (filters.projectId === undefined || session.projectId === filters.projectId),
+      ),
+  });
+
+  const firstResult = await runCommand(
+    ["ack", "--message", originalMessageIdentifier, "--json"],
+    dependencies,
+  );
+  const repeatedResult = await runCommand(
+    ["ack", "--message", originalMessageIdentifier, "--json"],
+    dependencies,
+  );
+  const foreignResult = await runCommand(
+    [
+      "ack",
+      "--message",
+      originalMessageIdentifier,
+      "--from",
+      otherCodexSessionIdentifier,
+    ],
+    dependencies,
+  );
+  const unknownResult = await runCommand(
+    ["ack", "--message", secondOriginalMessageIdentifier],
+    dependencies,
+  );
+
+  assert.equal(firstResult.exitCode, 0);
+  const firstPayload = JSON.parse(firstResult.stdout);
+  assert.equal(firstPayload.state, "seen");
+  assert.notEqual(firstPayload.acknowledged_at, null);
+  assert.equal(repeatedResult.exitCode, 0);
+  assert.deepEqual(JSON.parse(repeatedResult.stdout), firstPayload);
+  assert.equal(foreignResult.exitCode, 1);
+  assert.match(foreignResult.stderr, /did not receive message/u);
+  assert.equal(unknownResult.exitCode, 1);
+  assert.match(
+    unknownResult.stderr,
+    new RegExp(`no receipt for message ${secondOriginalMessageIdentifier}`, "u"),
+  );
+});
+
+test("reports a receipt with its timestamps and overdue verdict", async (testContext) => {
+  const { stateHomeDirectory, store } = await createReceiptStore(testContext);
+  await createAcceptedInboundMessage(store, originalMessageIdentifier);
+  const dependencies = createDependencies({
+    stateHomeDirectory,
+    messageStatusStore: store,
+    currentDate: () => new Date("2026-09-04T10:30:00.000Z"),
+  });
+
+  const result = await runCommand(
+    ["status", "--message", originalMessageIdentifier, "--json"],
+    dependencies,
+  );
+  const humanResult = await runCommand(
+    ["status", "--message", originalMessageIdentifier],
+    dependencies,
+  );
+  const unknownResult = await runCommand(
+    ["status", "--message", secondOriginalMessageIdentifier],
+    dependencies,
+  );
+
+  assert.equal(result.exitCode, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.message_id, originalMessageIdentifier);
+  assert.equal(payload.state, "accepted");
+  assert.equal(payload.transport_state, "accepted");
+  assert.equal(payload.sent_at, "2026-09-04T09:59:00.000Z");
+  assert.notEqual(payload.transport_accepted_at, null);
+  assert.equal(payload.acknowledged_at, null);
+  assert.equal(payload.replied_at, null);
+  assert.equal(payload.deadline_at, "2026-09-04T10:05:00.000Z");
+  assert.equal(payload.overdue, true);
+  assert.match(humanResult.stdout, /overdue\tyes/u);
+  assert.equal(unknownResult.exitCode, 1);
+  assert.equal(unknownResult.stdout, "");
+  assert.match(
+    unknownResult.stderr,
+    new RegExp(`no receipt for message ${secondOriginalMessageIdentifier}`, "u"),
+  );
+});
+
+test("waits for the receipt a message type requires and maps every outcome to an exit code", async (testContext) => {
+  const stateHomeDirectory = await mkdtemp("/private/tmp/ccb-cli-wait-");
+  testContext.after(() => rm(stateHomeDirectory, { recursive: true, force: true }));
+  const advancingClock = () => {
+    let currentTimestamp = Date.parse("2026-09-04T10:00:00.000Z");
+    return () => {
+      currentTimestamp += 600_000;
+      return new Date(currentTimestamp);
+    };
+  };
+  const waitDependencies = (
+    overrides: Partial<MessageStatusStore>,
+    currentDate?: () => Date,
+  ) =>
+    createDependencies({
+      stateHomeDirectory,
+      messageStatusStore: createStatusStoreStub(overrides),
+      ...(currentDate === undefined ? {} : { currentDate }),
+    });
+  const seenRecord = (state: MessageStatusRecord["state"]) => async () => ({
+    ...(await createStatusStoreStub().createPending(
+      claudeToCodexEnvelope(messageIdentifier),
+    )),
+    state,
+  });
+
+  const seenResult = await runCommand(
+    [
+      "send",
+      "--from",
+      localCodexSessionIdentifier,
+      "--to",
+      localClaudeSessionIdentifier,
+      "--type",
+      "message",
+      "--message",
+      "note",
+      "--wait-minutes",
+      "1",
+      "--json",
+    ],
+    waitDependencies({ get: seenRecord("seen") }),
+  );
+  const repliedResult = await runCommand(
+    [...sendArguments, "--wait-minutes", "1"],
+    waitDependencies({ get: seenRecord("replied") }),
+  );
+  const seenQuestionResult = await runCommand(
+    [...sendArguments, "--wait-minutes", "1"],
+    waitDependencies({ get: seenRecord("seen") }, advancingClock()),
+  );
+  const missingResult = await runCommand(
+    [...sendArguments, "--wait-minutes", "1"],
+    waitDependencies({ get: async () => undefined }),
+  );
+  const lockedResult = await runCommand(
+    [...sendArguments, "--wait-minutes", "1"],
+    waitDependencies(
+      {
+        get: async () => {
+          throw new MessageStatusLockTimeoutError();
+        },
+      },
+      advancingClock(),
+    ),
+  );
+  const invalidResult = await runCommand(
+    [...sendArguments, "--wait-minutes", "abc"],
+    waitDependencies({}),
+  );
+
+  assert.equal(seenResult.exitCode, 0);
+  assert.equal(JSON.parse(seenResult.stdout).outcome, "seen");
+  assert.equal(repliedResult.exitCode, 0);
+  assert.match(repliedResult.stdout, /ended the wait as replied/u);
+  assert.equal(seenQuestionResult.exitCode, 2);
+  assert.match(seenQuestionResult.stdout, /ended the wait as overdue/u);
+  assert.match(seenQuestionResult.stderr, /targetSessionAvailable\tfalse/u);
+  assert.match(seenQuestionResult.stderr, /action\t/u);
+  assert.equal(missingResult.exitCode, 1);
+  assert.match(missingResult.stderr, /no receipt for message/u);
+  assert.equal(lockedResult.exitCode, 3);
+  assert.match(lockedResult.stderr, /receipt_lock_timeout/u);
+  assert.equal(invalidResult.exitCode, 1);
+  assert.match(invalidResult.stderr, /--wait-minutes must be a number/u);
+});
+
+test("prints usage for the receipt commands and their flags", async () => {
+  const dependencies = createDependencies();
+
+  const result = await runCommand(["help"], dependencies);
+
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdout, /ack --message <message-id> \[--from <session>\] \[--json\]/u);
+  assert.match(result.stdout, /status --message <message-id> \[--json\]/u);
+  assert.match(result.stdout, /clean \[--json\]/u);
+  assert.match(result.stdout, /\[--wait-minutes <minutes>\]/u);
+  assert.match(result.stdout, /\[--reply-to <message-id>\]/u);
+});
+
+test("reports a delivered message whose receipt could not be updated as a warning", async () => {
+  const failingAcceptStore = createStatusStoreStub({
+    markAccepted: async () => {
+      throw new Error("receipt store is locked");
+    },
+  });
+  const dependencies = createDependencies({ messageStatusStore: failingAcceptStore });
+
+  const jsonResult = await runCommand([...sendArguments, "--json"], dependencies);
+  const humanResult = await runCommand(sendArguments, dependencies);
+
+  assert.equal(jsonResult.exitCode, 0);
+  const payload = JSON.parse(jsonResult.stdout);
+  assert.equal(payload.message_id, messageIdentifier);
+  assert.equal(payload.delivered, true);
+  assert.equal(payload.status.state, "pending");
+  assert.match(payload.receipt_warning, /was delivered but its receipt could not be updated/u);
+  assert.match(payload.receipt_warning, new RegExp(messageIdentifier, "u"));
+  assert.match(jsonResult.stderr, /receipt store is locked/u);
+  assert.equal(humanResult.exitCode, 0);
+  assert.match(humanResult.stdout, /Transport accepted/u);
+  assert.match(humanResult.stderr, new RegExp(`Message ${messageIdentifier} was delivered`, "u"));
+});
+
+test("reports a delivered reply whose correlation could not be recorded as a warning", async (testContext) => {
+  const { stateHomeDirectory, store } = await createReceiptStore(testContext);
+  await createAcceptedInboundMessage(store, originalMessageIdentifier);
+  const correlationFailingStore: MessageStatusStore = {
+    ...store,
+    markReplied: async () => {
+      throw new Error("receipt store is locked");
+    },
+  };
+  const dependencies = createDependencies({
+    stateHomeDirectory,
+    messageStatusStore: correlationFailingStore,
+    randomIdentifier: () => messageIdentifier,
+    conversationRouteStore: createMemoryRouteStore([codexReplyRoute()]),
+  });
+
+  const result = await runCommand(
+    ["reply", "--conversation", conversationIdentifier, "--message", "done", "--json"],
+    dependencies,
+  );
+
+  assert.equal(result.exitCode, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.delivered, true);
+  assert.equal(payload.status.state, "accepted");
+  assert.match(payload.receipt_warning, new RegExp(`Message ${messageIdentifier} was delivered`, "u"));
+  assert.match(result.stderr, /receipt store is locked/u);
+  assert.equal((await store.get(originalMessageIdentifier))?.state, "accepted");
+});
+
+test("cleans orphaned bridge state and reports every skipped path with its reason", async () => {
+  const dependencies = createDependencies({
+    cleanupBridgeState: async () => ({
+      removedSockets: 2,
+      removedSessionRecords: 1,
+      skipped: [
+        {
+          path: "/state/sockets/c-0123456789abcdef.sock",
+          reason: "socket still accepts connections",
+        },
+      ],
+    }),
+  });
+
+  const jsonResult = await runCommand(["clean", "--json"], dependencies);
+  const humanResult = await runCommand(["clean"], dependencies);
+
+  assert.equal(jsonResult.exitCode, 0);
+  assert.deepEqual(JSON.parse(jsonResult.stdout), {
+    removed_sockets: 2,
+    removed_session_records: 1,
+    skipped: [
+      {
+        path: "/state/sockets/c-0123456789abcdef.sock",
+        reason: "socket still accepts connections",
+      },
+    ],
+  });
+  assert.equal(humanResult.exitCode, 0);
+  assert.equal(humanResult.stderr, "");
+  assert.equal(
+    humanResult.stdout,
+    [
+      "removed_sockets\t2",
+      "removed_session_records\t1",
+      "skipped\t/state/sockets/c-0123456789abcdef.sock\tsocket still accepts connections",
+      "",
+    ].join("\n"),
+  );
 });

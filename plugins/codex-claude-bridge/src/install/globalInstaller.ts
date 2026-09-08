@@ -4,6 +4,10 @@ import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  createMessageStatusStore,
+  type MessageStatusRecord,
+} from "../conversations/messageStatusStore.js";
 import type { ActiveSessionRecord } from "../registry/activeSessionRegistry.js";
 import type { SecureBridgeStateContext } from "../registry/secureStateFilesystem.js";
 import { resolveStateHomeDirectory } from "../runtime/paths.js";
@@ -77,6 +81,7 @@ export interface GlobalInstallerOptions {
   writeOutput?: (value: string) => void;
   listActiveSessions?: () => Promise<ActiveSessionRecord[]>;
   listRunningClaudeProcessIdentifiers?: () => Promise<number[]>;
+  listOverdueMessages?: () => Promise<MessageStatusRecord[]>;
   processGroupIsActive?: (processGroupIdentifier: number) => Promise<boolean>;
   confirmPendingCommandStopped?: boolean;
   installationLockTimeoutSeconds?: number;
@@ -1686,6 +1691,36 @@ async function listClaudeProcessIdentifiersThroughProcessStatus(
   return parseClaudeProcessIdentifiers(result.stdout);
 }
 
+async function addOverdueMessagesCheck(
+  checks: DoctorCheck[],
+  options: GlobalInstallerOptions,
+  context: ResolvedInstallerContext,
+): Promise<void> {
+  try {
+    const overdueMessages = await (options.listOverdueMessages ??
+      (() =>
+        createMessageStatusStore({
+          stateHomeDirectory: context.stateHomeDirectory,
+        }).listOverdue()))();
+    checks.push({
+      name: "overdue_messages",
+      status: "info",
+      message:
+        overdueMessages.length === 0
+          ? "No overdue message receipts"
+          : `${overdueMessages.length} overdue message receipts: ${overdueMessages
+              .map(({ messageId }) => messageId)
+              .join(", ")}`,
+    });
+  } catch (error) {
+    checks.push({
+      name: "overdue_messages",
+      status: "info",
+      message: `Overdue message receipts were not inspected: ${error instanceof Error ? error.message : "unknown error"}`,
+    });
+  }
+}
+
 function bridgeIsNotInstalledReport(): DoctorReport {
   return {
     ok: false,
@@ -1895,6 +1930,7 @@ export async function doctorBridgeInstallation(
       message: `Running Claude processes were not inspected: ${error instanceof Error ? error.message : "unknown error"}`,
     });
   }
+  await addOverdueMessagesCheck(checks, options, context);
   return {
     ok: !checks.some(({ status }) => status === "failed"),
     checks,

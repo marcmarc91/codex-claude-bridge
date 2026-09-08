@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
 import {
+  ChannelTransportError,
   deliverClaudeMessage,
   type DeliverClaudeMessageOptions,
 } from "../channel/channelSocketClient.js";
@@ -13,6 +14,16 @@ import {
   type ConversationRouteReservationCondition,
   type ConversationRouteStore,
 } from "../conversations/conversationRoutes.js";
+import {
+  createMessageStatusStore,
+  resolveMessageTimeoutMinutes,
+  type MessageStatusRecord,
+  type MessageStatusStore,
+} from "../conversations/messageStatusStore.js";
+import {
+  waitForMessageStatus,
+  type MessageDeliveryDiagnosis,
+} from "../conversations/messageWatchdog.js";
 import { runCodexSessionHookFromStandardInput } from "../hooks/codexSessionHook.js";
 import {
   doctorBridgeInstallation,
@@ -35,6 +46,10 @@ import {
 } from "../registry/activeSessionRegistry.js";
 import { resolveProjectIdentity } from "../registry/projectIdentity.js";
 import {
+  cleanupOrphanedBridgeState,
+  type BridgeStateCleanupSummary,
+} from "../registry/stateHygiene.js";
+import {
   launchBridgeRuntime,
   type BridgeRuntimeName,
 } from "../wrapper/runtimeLauncher.js";
@@ -54,6 +69,7 @@ export interface CommandLineDependencies {
     filters?: ActiveSessionFilters,
   ) => Promise<ActiveSessionRecord[]>;
   conversationRouteStore: ConversationRouteStore;
+  messageStatusStore: MessageStatusStore;
   deliverClaudeMessage: (
     options: DeliverClaudeMessageOptions,
   ) => ReturnType<typeof deliverClaudeMessage>;
@@ -68,6 +84,7 @@ export interface CommandLineDependencies {
     confirmPendingCommandStopped: boolean,
   ) => Promise<void>;
   doctorBridgeInstallation: () => Promise<DoctorReport>;
+  cleanupBridgeState: () => Promise<BridgeStateCleanupSummary>;
   setupBridge: (
     writeOutput: (value: string) => void,
     setupOptions: BridgeSetupCommandOptions,
@@ -94,6 +111,33 @@ interface OptionDefinition {
 type ParsedOptions = Record<string, string | true>;
 
 const sendMessageTypeSchema = z.enum(["message", "question", "handoff"]);
+
+const usageText = [
+  "Usage: codex-claude-bridge <command> [options]",
+  "",
+  "Commands:",
+  "  sessions [--runtime <claude|codex>] [--project <path>] [--json]",
+  "  send --from <session> --to <session> --type <message|question|handoff>",
+  "       --message <text> [--wait-minutes <minutes>] [--json]",
+  "  reply --conversation <conversation-id> --message <text>",
+  "       [--reply-to <message-id>] [--json]",
+  "  ack --message <message-id> [--from <session>] [--json]",
+  "  status --message <message-id> [--json]",
+  "  clean [--json]",
+  "  setup [--no-vscode] [--vscode-settings <path>]",
+  "       [--confirm-pending-command-stopped]",
+  "  launch <claude|codex> [runtime arguments...]",
+  "  install --global [--confirm-pending-command-stopped]",
+  "  uninstall --global [--confirm-pending-command-stopped]",
+  "  doctor [--json]",
+  "  help",
+  "",
+  "send --wait-minutes waits for an explicit receipt: seen for a message, replied",
+  "for a question or a handoff. It exits 0 when that receipt arrives, 1 when the",
+  "receipt is missing, 2 when the deadline passes without it, and 3 when the",
+  "receipt store stays locked.",
+  "",
+].join("\n");
 
 function parseOptions(
   argumentsList: string[],
@@ -211,17 +255,103 @@ async function resolveExactClaudeTarget(
   return target;
 }
 
-async function deliverWithReservedRoute(
+function addressesMatch(first: AgentAddress, second: AgentAddress): boolean {
+  return (
+    first.runtime === second.runtime &&
+    first.sessionId === second.sessionId &&
+    first.projectId === second.projectId
+  );
+}
+
+function transportFailureOutcome(error: unknown): "unknown" | "failed" {
+  return error instanceof ChannelTransportError &&
+    (error.code === "ECONNREFUSED" || error.code === "ENOENT")
+    ? "failed"
+    : "unknown";
+}
+
+function channelTransportCode(error: unknown): string | undefined {
+  if (error instanceof ChannelTransportError) {
+    return error.code;
+  }
+  if (error instanceof AggregateError) {
+    for (const nestedError of error.errors) {
+      const nestedCode = channelTransportCode(nestedError);
+      if (nestedCode !== undefined) {
+        return nestedCode;
+      }
+    }
+  }
+  return undefined;
+}
+
+function describeCommandError(error: unknown): string {
+  const message = error instanceof Error ? error.message : "Command failed";
+  const transportCode = channelTransportCode(error);
+  return transportCode === undefined ? message : `${message} (${transportCode})`;
+}
+
+async function rollbackRouteAfterFailure(
+  routeStore: ConversationRouteStore,
+  reservation: Awaited<ReturnType<ConversationRouteStore["reserve"]>>,
+  deliveryError: unknown,
+): Promise<never> {
+  try {
+    await routeStore.rollback(reservation);
+  } catch (rollbackError) {
+    const deliveryMessage =
+      deliveryError instanceof Error ? deliveryError.message : "Channel delivery failed";
+    const rollbackMessage =
+      rollbackError instanceof Error ? rollbackError.message : "route rollback failed";
+    throw new AggregateError(
+      [deliveryError, rollbackError],
+      `${deliveryMessage}; route rollback failed: ${rollbackMessage}`,
+    );
+  }
+  throw deliveryError;
+}
+
+interface TrackedDelivery {
+  status: MessageStatusRecord;
+  receiptWarning?: string;
+}
+
+function receiptUpdateWarning(messageId: string, error: unknown): string {
+  return `Message ${messageId} was delivered but its receipt could not be updated: ${describeCommandError(error)}`;
+}
+
+async function createPendingReceipt(
+  envelope: AgentMessageEnvelope,
+  dependencies: CommandLineDependencies,
+  reservation: Awaited<ReturnType<ConversationRouteStore["reserve"]>>,
+): Promise<MessageStatusRecord> {
+  try {
+    return await dependencies.messageStatusStore.createPending(envelope);
+  } catch (error) {
+    return rollbackRouteAfterFailure(
+      dependencies.conversationRouteStore,
+      reservation,
+      error,
+    );
+  }
+}
+
+async function deliverTrackedMessage(
   envelope: AgentMessageEnvelope,
   targetSession: ActiveSessionRecord,
   endpoints: ConversationRouteEndpoints,
   dependencies: CommandLineDependencies,
   condition?: ConversationRouteReservationCondition,
-): Promise<void> {
+): Promise<TrackedDelivery> {
   const reservation = await dependencies.conversationRouteStore.reserve(
     envelope.conversationId,
     endpoints,
     condition,
+  );
+  const pendingStatus = await createPendingReceipt(
+    envelope,
+    dependencies,
+    reservation,
   );
   try {
     const response = await dependencies.deliverClaudeMessage({
@@ -236,43 +366,187 @@ async function deliverWithReservedRoute(
       throw new Error("Channel acknowledgement message ID does not match");
     }
   } catch (error) {
-    try {
-      await dependencies.conversationRouteStore.rollback(reservation);
-    } catch (rollbackError) {
-      const deliveryMessage =
-        error instanceof Error ? error.message : "Channel delivery failed";
-      const rollbackMessage =
-        rollbackError instanceof Error
-          ? rollbackError.message
-          : "route rollback failed";
-      throw new AggregateError(
-        [error, rollbackError],
-        `${deliveryMessage}; route rollback failed: ${rollbackMessage}`,
-      );
-    }
-    throw error;
+    await dependencies.messageStatusStore
+      .markTransportFailure(envelope.messageId, transportFailureOutcome(error))
+      .catch(() => undefined);
+    await rollbackRouteAfterFailure(
+      dependencies.conversationRouteStore,
+      reservation,
+      error,
+    );
   }
+  try {
+    return { status: await dependencies.messageStatusStore.markAccepted(envelope.messageId) };
+  } catch (error) {
+    return {
+      status: pendingStatus,
+      receiptWarning: receiptUpdateWarning(envelope.messageId, error),
+    };
+  }
+}
+
+function deliveryResultPayload(
+  envelope: AgentMessageEnvelope,
+  status: MessageStatusRecord,
+  receiptWarning: string | undefined,
+) {
+  return {
+    delivered: true,
+    message_id: envelope.messageId,
+    conversation_id: envelope.conversationId,
+    acknowledgement: "transport acknowledgement only",
+    status,
+    ...(receiptWarning === undefined ? {} : { receipt_warning: receiptWarning }),
+  };
 }
 
 function writeDeliveryResult(
   envelope: AgentMessageEnvelope,
+  delivery: TrackedDelivery,
   useJson: boolean,
   writeOutput: (value: string) => void,
+  writeError: (value: string) => void,
 ): void {
   if (useJson) {
     writeOutput(
+      `${JSON.stringify(deliveryResultPayload(envelope, delivery.status, delivery.receiptWarning))}\n`,
+    );
+  } else {
+    writeOutput(
+      `Transport accepted message ${envelope.messageId} in conversation ${envelope.conversationId}; receipt state ${delivery.status.state}; transport acknowledgement only.\n`,
+    );
+  }
+  if (delivery.receiptWarning !== undefined) {
+    writeError(`${delivery.receiptWarning}\n`);
+  }
+}
+
+function messageIsOverdue(record: MessageStatusRecord, now: Date): boolean {
+  return (
+    (record.messageType === "question" || record.messageType === "handoff") &&
+    record.repliedAt === undefined &&
+    record.transportState !== "failed" &&
+    Date.parse(record.deadlineAt) <= now.getTime()
+  );
+}
+
+function writeMessageStatus(
+  record: MessageStatusRecord,
+  now: Date,
+  useJson: boolean,
+  writeOutput: (value: string) => void,
+): void {
+  const overdue = messageIsOverdue(record, now);
+  if (useJson) {
+    writeOutput(
       `${JSON.stringify({
-        delivered: true,
-        message_id: envelope.messageId,
-        conversation_id: envelope.conversationId,
-        acknowledgement: "transport acknowledgement only",
+        message_id: record.messageId,
+        conversation_id: record.conversationId,
+        message_type: record.messageType,
+        state: record.state,
+        transport_state: record.transportState,
+        sent_at: record.sentAt,
+        transport_accepted_at: record.transportAcceptedAt ?? null,
+        acknowledged_at: record.acknowledgedAt ?? null,
+        replied_at: record.repliedAt ?? null,
+        deadline_at: record.deadlineAt,
+        overdue,
       })}\n`,
     );
     return;
   }
   writeOutput(
-    `Transport accepted message ${envelope.messageId} in conversation ${envelope.conversationId}; transport acknowledgement only.\n`,
+    `${[
+      ["message_id", record.messageId],
+      ["conversation_id", record.conversationId],
+      ["message_type", record.messageType],
+      ["state", record.state],
+      ["transport_state", record.transportState],
+      ["sent_at", record.sentAt],
+      ["transport_accepted_at", record.transportAcceptedAt ?? "-"],
+      ["acknowledged_at", record.acknowledgedAt ?? "-"],
+      ["replied_at", record.repliedAt ?? "-"],
+      ["deadline_at", record.deadlineAt],
+      ["overdue", overdue ? "yes" : "no"],
+    ]
+      .map(([field, value]) => `${field}\t${value}`)
+      .join("\n")}\n`,
   );
+}
+
+function parseWaitMinutes(rawValue: string): number {
+  try {
+    return resolveMessageTimeoutMinutes(Number(rawValue));
+  } catch {
+    throw new TypeError(
+      "Argument --wait-minutes must be a number of minutes between 0.01 and 1440",
+    );
+  }
+}
+
+function formatDeliveryDiagnosis(diagnosis: MessageDeliveryDiagnosis): string {
+  return `${Object.entries(diagnosis)
+    .map(([field, value]) => `${field}\t${String(value)}`)
+    .join("\n")}\n`;
+}
+
+async function waitForDeliveryReceipt(
+  envelope: AgentMessageEnvelope,
+  delivery: TrackedDelivery,
+  waitMinutes: number,
+  dependencies: CommandLineDependencies,
+  useJson: boolean,
+  writeOutput: (value: string) => void,
+  writeError: (value: string) => void,
+): Promise<number> {
+  const waitResult = await waitForMessageStatus({
+    store: dependencies.messageStatusStore,
+    messageId: envelope.messageId,
+    waitMinutes,
+    until: envelope.messageType === "message" ? "seen" : "replied",
+    currentDate: dependencies.currentDate,
+    ...(dependencies.stateHomeDirectory === undefined
+      ? {}
+      : { stateHomeDirectory: dependencies.stateHomeDirectory }),
+  });
+  if (useJson) {
+    writeOutput(
+      `${JSON.stringify({
+        ...deliveryResultPayload(
+          envelope,
+          waitResult.status ?? delivery.status,
+          delivery.receiptWarning,
+        ),
+        outcome: waitResult.outcome,
+        ...(waitResult.reason === undefined ? {} : { reason: waitResult.reason }),
+        ...(waitResult.diagnosis === undefined
+          ? {}
+          : { diagnosis: waitResult.diagnosis }),
+      })}\n`,
+    );
+  } else {
+    writeOutput(
+      `Message ${envelope.messageId} ended the wait as ${waitResult.outcome}.\n`,
+    );
+  }
+  if (delivery.receiptWarning !== undefined) {
+    writeError(`${delivery.receiptWarning}\n`);
+  }
+  if (waitResult.outcome === "seen" || waitResult.outcome === "replied") {
+    return 0;
+  }
+  if (waitResult.outcome === "overdue") {
+    if (waitResult.diagnosis !== undefined) {
+      writeError(formatDeliveryDiagnosis(waitResult.diagnosis));
+    }
+    return 2;
+  }
+  if (waitResult.reason === "receipt_lock_timeout") {
+    writeError(`receipt_lock_timeout\n`);
+    return 3;
+  }
+  writeError(`no receipt for message ${envelope.messageId}\n`);
+  return 1;
 }
 
 async function runSessionsCommand(
@@ -339,14 +613,22 @@ async function runSendCommand(
   argumentsList: string[],
   dependencies: CommandLineDependencies,
   writeOutput: (value: string) => void,
-): Promise<void> {
+  writeError: (value: string) => void,
+): Promise<number> {
   const options = parseOptions(argumentsList, {
     "--from": { takesValue: true, required: true },
     "--to": { takesValue: true, required: true },
     "--type": { takesValue: true, required: true },
     "--message": { takesValue: true, required: true },
+    "--wait-minutes": { takesValue: true },
     "--json": { takesValue: false },
   });
+  const useJson = options["--json"] === true;
+  const requestedWaitMinutes = options["--wait-minutes"];
+  const waitMinutes =
+    typeof requestedWaitMinutes === "string"
+      ? parseWaitMinutes(requestedWaitMinutes)
+      : undefined;
   const currentProjectIdentifier = await dependencies.resolveProjectIdentity(
     dependencies.currentWorkingDirectory,
   );
@@ -376,18 +658,179 @@ async function runSendCommand(
     content: optionValue(options, "--message"),
     replyRoute: endpoints.codex,
   });
-  await deliverWithReservedRoute(envelope, target, endpoints, dependencies);
-  writeDeliveryResult(envelope, options["--json"] === true, writeOutput);
+  const delivery = await deliverTrackedMessage(
+    envelope,
+    target,
+    endpoints,
+    dependencies,
+  );
+  if (waitMinutes === undefined) {
+    writeDeliveryResult(envelope, delivery, useJson, writeOutput, writeError);
+    return 0;
+  }
+  return waitForDeliveryReceipt(
+    envelope,
+    delivery,
+    waitMinutes,
+    dependencies,
+    useJson,
+    writeOutput,
+    writeError,
+  );
+}
+
+async function resolveReplyTarget(
+  conversationIdentifier: string,
+  route: { codex: AgentAddress; claude: AgentAddress },
+  requestedReplyTarget: string | true | undefined,
+  dependencies: CommandLineDependencies,
+): Promise<MessageStatusRecord | undefined> {
+  if (typeof requestedReplyTarget !== "string") {
+    return dependencies.messageStatusStore.findReplyTarget(
+      conversationIdentifier,
+      route.codex,
+    );
+  }
+  const replyTargetIdentifier = uuidSchema.parse(requestedReplyTarget);
+  const replyTarget =
+    await dependencies.messageStatusStore.get(replyTargetIdentifier);
+  if (
+    replyTarget === undefined ||
+    replyTarget.conversationId !== conversationIdentifier ||
+    !addressesMatch(replyTarget.recipient, route.codex) ||
+    !addressesMatch(replyTarget.sender, route.claude) ||
+    replyTarget.repliedAt !== undefined
+  ) {
+    throw new Error(
+      `Message "${replyTargetIdentifier}" is not an unanswered message addressed to this Codex session`,
+    );
+  }
+  return replyTarget;
+}
+
+async function resolveReceivingCodexSession(
+  record: MessageStatusRecord,
+  requestedSelector: string | true | undefined,
+  dependencies: CommandLineDependencies,
+): Promise<ActiveSessionRecord> {
+  if (record.recipient.runtime !== "codex") {
+    throw new Error(
+      `Message ${record.messageId} was not addressed to a Codex session`,
+    );
+  }
+  if (typeof requestedSelector === "string") {
+    const selectedSession = await selectSession(
+      requestedSelector,
+      "codex",
+      record.recipient.projectId,
+      dependencies,
+    );
+    if (!addressesMatch(sessionAddress(selectedSession), record.recipient)) {
+      throw new Error(
+        `Session "${requestedSelector}" did not receive message ${record.messageId}`,
+      );
+    }
+    return selectedSession;
+  }
+  const receivingSession = (
+    await dependencies.listActiveSessions({
+      runtime: "codex",
+      projectId: record.recipient.projectId,
+    })
+  ).find((session) => addressesMatch(sessionAddress(session), record.recipient));
+  if (receivingSession === undefined) {
+    throw new Error(
+      `No active codex session matches "${record.recipient.sessionId}"`,
+    );
+  }
+  return receivingSession;
+}
+
+async function runAcknowledgeCommand(
+  argumentsList: string[],
+  dependencies: CommandLineDependencies,
+  writeOutput: (value: string) => void,
+): Promise<void> {
+  const options = parseOptions(argumentsList, {
+    "--message": { takesValue: true, required: true },
+    "--from": { takesValue: true },
+    "--json": { takesValue: false },
+  });
+  const messageIdentifier = uuidSchema.parse(optionValue(options, "--message"));
+  const record = await dependencies.messageStatusStore.get(messageIdentifier);
+  if (record === undefined) {
+    throw new Error(`no receipt for message ${messageIdentifier}`);
+  }
+  const receivingSession = await resolveReceivingCodexSession(
+    record,
+    options["--from"],
+    dependencies,
+  );
+  const status = await dependencies.messageStatusStore.markSeen(
+    messageIdentifier,
+    sessionAddress(receivingSession),
+  );
+  writeMessageStatus(
+    status,
+    dependencies.currentDate(),
+    options["--json"] === true,
+    writeOutput,
+  );
+}
+
+async function runStatusCommand(
+  argumentsList: string[],
+  dependencies: CommandLineDependencies,
+  writeOutput: (value: string) => void,
+  writeError: (value: string) => void,
+): Promise<number> {
+  const options = parseOptions(argumentsList, {
+    "--message": { takesValue: true, required: true },
+    "--json": { takesValue: false },
+  });
+  const messageIdentifier = uuidSchema.parse(optionValue(options, "--message"));
+  const record = await dependencies.messageStatusStore.get(messageIdentifier);
+  if (record === undefined) {
+    writeError(`no receipt for message ${messageIdentifier}\n`);
+    return 1;
+  }
+  writeMessageStatus(
+    record,
+    dependencies.currentDate(),
+    options["--json"] === true,
+    writeOutput,
+  );
+  return 0;
+}
+
+async function correlateDeliveredReply(
+  replyTarget: MessageStatusRecord,
+  envelope: AgentMessageEnvelope,
+  replyingCodexAddress: AgentAddress,
+  dependencies: CommandLineDependencies,
+): Promise<string | undefined> {
+  try {
+    await dependencies.messageStatusStore.markReplied(
+      replyTarget.messageId,
+      replyingCodexAddress,
+      envelope.messageId,
+    );
+    return undefined;
+  } catch (error) {
+    return receiptUpdateWarning(envelope.messageId, error);
+  }
 }
 
 async function runReplyCommand(
   argumentsList: string[],
   dependencies: CommandLineDependencies,
   writeOutput: (value: string) => void,
+  writeError: (value: string) => void,
 ): Promise<void> {
   const options = parseOptions(argumentsList, {
     "--conversation": { takesValue: true, required: true },
     "--message": { takesValue: true, required: true },
+    "--reply-to": { takesValue: true },
     "--json": { takesValue: false },
   });
   const conversationIdentifier = uuidSchema.parse(
@@ -403,6 +846,12 @@ async function runReplyCommand(
     throw new Error(`Conversation "${conversationIdentifier}" does not authorize a Codex reply`);
   }
   const target = await resolveExactClaudeTarget(route.claude, dependencies);
+  const replyTarget = await resolveReplyTarget(
+    conversationIdentifier,
+    route,
+    options["--reply-to"],
+    dependencies,
+  );
   const envelope = createEnvelope(dependencies, {
     conversationId: conversationIdentifier,
     messageType: "reply",
@@ -410,8 +859,11 @@ async function runReplyCommand(
     recipient: route.claude,
     content: optionValue(options, "--message"),
     replyRoute: route.codex,
+    ...(replyTarget === undefined
+      ? {}
+      : { replyToMessageId: replyTarget.messageId }),
   });
-  await deliverWithReservedRoute(
+  const delivery = await deliverTrackedMessage(
     envelope,
     target,
     {
@@ -426,7 +878,51 @@ async function runReplyCommand(
       requiredReplyCapability: "codex",
     },
   );
-  writeDeliveryResult(envelope, options["--json"] === true, writeOutput);
+  const correlationWarning =
+    replyTarget === undefined
+      ? undefined
+      : await correlateDeliveredReply(
+          replyTarget,
+          envelope,
+          route.codex,
+          dependencies,
+        );
+  writeDeliveryResult(
+    envelope,
+    {
+      status: delivery.status,
+      receiptWarning: delivery.receiptWarning ?? correlationWarning,
+    },
+    options["--json"] === true,
+    writeOutput,
+    writeError,
+  );
+}
+
+async function runCleanCommand(
+  argumentsList: string[],
+  dependencies: CommandLineDependencies,
+  writeOutput: (value: string) => void,
+): Promise<void> {
+  const options = parseOptions(argumentsList, { "--json": { takesValue: false } });
+  const summary = await dependencies.cleanupBridgeState();
+  if (options["--json"] === true) {
+    writeOutput(
+      `${JSON.stringify({
+        removed_sockets: summary.removedSockets,
+        removed_session_records: summary.removedSessionRecords,
+        skipped: summary.skipped.map(({ path, reason }) => ({ path, reason })),
+      })}\n`,
+    );
+    return;
+  }
+  writeOutput(
+    `${[
+      `removed_sockets\t${summary.removedSockets}`,
+      `removed_session_records\t${summary.removedSessionRecords}`,
+      ...summary.skipped.map(({ path, reason }) => `skipped\t${path}\t${reason}`),
+    ].join("\n")}\n`,
+  );
 }
 
 function createDefaultDependencies(): CommandLineDependencies {
@@ -437,6 +933,7 @@ function createDefaultDependencies(): CommandLineDependencies {
     resolveProjectIdentity,
     listActiveSessions: (filters = {}) => listActiveSessions(filters),
     conversationRouteStore: createConversationRouteStore(),
+    messageStatusStore: createMessageStatusStore(),
     deliverClaudeMessage,
     runCodexSessionHookFromStandardInput,
     startClaudeChannelServer,
@@ -445,6 +942,7 @@ function createDefaultDependencies(): CommandLineDependencies {
     uninstallBridgeGlobally: (writeOutput, confirmPendingCommandStopped) =>
       uninstallBridgeGlobally({ writeOutput, confirmPendingCommandStopped }),
     doctorBridgeInstallation: () => doctorBridgeInstallation(),
+    cleanupBridgeState: () => cleanupOrphanedBridgeState(),
     setupBridge: (writeOutput, setupOptions) =>
       setupBridge({ writeOutput, ...setupOptions }),
     launchBridgeRuntime,
@@ -497,6 +995,7 @@ function writeSetupNextSteps(writeOutput: (value: string) => void): void {
       "  codex-claude-bridge launch claude",
       "  codex-claude-bridge launch codex",
       "Approve the Claude development Channel prompt and the Codex hook-trust prompt once per machine.",
+      "Optional: codex-claude-bridge clean removes sockets left by crashed sessions.",
       "",
     ].join("\n"),
   );
@@ -522,11 +1021,33 @@ export async function runCommandLine(options: RunCommandLineOptions): Promise<nu
         await runSessionsCommand(commandArguments, dependencies, writeOutput);
         break;
       case "send":
-        await runSendCommand(commandArguments, dependencies, writeOutput);
-        break;
+        return await runSendCommand(
+          commandArguments,
+          dependencies,
+          writeOutput,
+          writeError,
+        );
       case "reply":
-        await runReplyCommand(commandArguments, dependencies, writeOutput);
+        await runReplyCommand(
+          commandArguments,
+          dependencies,
+          writeOutput,
+          writeError,
+        );
         break;
+      case "clean":
+        await runCleanCommand(commandArguments, dependencies, writeOutput);
+        break;
+      case "ack":
+        await runAcknowledgeCommand(commandArguments, dependencies, writeOutput);
+        break;
+      case "status":
+        return await runStatusCommand(
+          commandArguments,
+          dependencies,
+          writeOutput,
+          writeError,
+        );
       case "codex-session-hook":
         parseOptions(commandArguments, {});
         await dependencies.runCodexSessionHookFromStandardInput();
@@ -583,14 +1104,19 @@ export async function runCommandLine(options: RunCommandLineOptions): Promise<nu
         writeDoctorReport(report, doctorOptions["--json"] === true, writeOutput);
         return report.ok ? 0 : 1;
       }
+      case "help":
+      case "--help":
+        parseOptions(commandArguments, {});
+        writeOutput(usageText);
+        break;
       default:
         throw new TypeError(
-          command === undefined ? "Missing command" : `Unknown command: ${command}`,
+          `${command === undefined ? "Missing command" : `Unknown command: ${command}`}; run codex-claude-bridge help`,
         );
     }
     return 0;
   } catch (error) {
-    writeError(`${error instanceof Error ? error.message : "Command failed"}\n`);
+    writeError(`${describeCommandError(error)}\n`);
     return 1;
   }
 }

@@ -107,6 +107,13 @@ function publicStatus(record: StoredMessageStatus): MessageStatusRecord {
   };
 }
 
+export class MessageStatusLockTimeoutError extends Error {
+  constructor() {
+    super("Timed out acquiring the message status lock");
+    this.name = "MessageStatusLockTimeoutError";
+  }
+}
+
 async function acquireMessageStatusLock(fileDescriptor: number): Promise<void> {
   const exitCode = await new Promise<number | null>((resolveExit, rejectExit) => {
     const lockProcess = spawn("/usr/bin/lockf", ["-s", "-t", "4", "3"], {
@@ -116,6 +123,7 @@ async function acquireMessageStatusLock(fileDescriptor: number): Promise<void> {
     lockProcess.once("error", rejectExit);
     lockProcess.once("close", resolveExit);
   });
+  if (exitCode === 75) throw new MessageStatusLockTimeoutError();
   if (exitCode !== 0) {
     throw new Error("Unable to acquire the message status lock");
   }

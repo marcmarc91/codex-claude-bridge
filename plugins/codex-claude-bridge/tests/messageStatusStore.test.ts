@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { fork } from "node:child_process";
+import { fork, spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdtemp, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
 import {
   createMessageStatusStore,
+  MessageStatusLockTimeoutError,
   resolveMessageTimeoutMinutes,
 } from "../src/conversations/messageStatusStore.js";
 import type { AgentAddress, AgentMessageEnvelope } from "../src/protocol/messageEnvelope.js";
@@ -262,6 +264,32 @@ test("capacity reclaims definite failures but preserves uncertain delivery", asy
   await store.createPending(messageEnvelope(3));
   assert.equal(await store.get(messageIdentifier(2)), undefined);
   assert.equal((await store.get(messageIdentifier(1)))?.transportState, "unknown");
+});
+
+test("a real contended receipt lock produces the dedicated temporary timeout error", { timeout: 15_000 }, async (testContext) => {
+  const fixture = await createTestState(testContext);
+  const record = await fixture.store.createPending(messageEnvelope());
+  const lockHolder = spawn("/usr/bin/lockf", [
+    "-k", join(fixture.messagesDirectory, ".mutation.lock"), process.execPath,
+    "-e", "process.stdout.write('ready'); setTimeout(() => {}, 10000)",
+  ], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  const holderClosed = once(lockHolder, "close");
+  try {
+    const readiness = await Promise.race([
+      once(lockHolder.stdout!, "data").then(([data]) => String(data)),
+      holderClosed.then(() => { throw new Error("Lock holder exited before readiness"); }),
+    ]);
+    assert.equal(readiness, "ready");
+    await assert.rejects(fixture.store.get(record.messageId), MessageStatusLockTimeoutError);
+  } finally {
+    if (lockHolder.pid !== undefined) {
+      try { process.kill(-lockHolder.pid, "SIGTERM"); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+    }
+    await holderClosed;
+  }
+  assert.equal((await fixture.store.get(record.messageId))?.messageId, record.messageId);
 });
 
 test("independent stores enforce the global capacity atomically", async (testContext) => {

@@ -7,6 +7,7 @@ import {
   waitForMessageStatus,
 } from "../src/conversations/messageWatchdog.js";
 import type { MessageStatusRecord, MessageStatusStore } from "../src/conversations/messageStatusStore.js";
+import { MessageStatusLockTimeoutError } from "../src/conversations/messageStatusStore.js";
 import type { AgentAddress } from "../src/protocol/messageEnvelope.js";
 import type { ActiveSessionRecord } from "../src/registry/activeSessionRegistry.js";
 
@@ -216,6 +217,70 @@ test("waiting until replied keeps a seen receipt pending until the configured de
   assert.equal(result.status?.state, "seen");
   assert.equal(result.diagnosis?.queueVisibility, "agent_acknowledged");
   assert.equal(inspections, 1);
+});
+
+test("wait retries only temporary receipt lock contention before returning an explicit reply", async () => {
+  const record = statusRecord({ state: "replied", repliedAt: timestamp });
+  let reads = 0;
+  const result = await waitForMessageStatus({
+    store: fakeStore([], { get: async () => {
+      if (++reads === 1) throw new MessageStatusLockTimeoutError();
+      return record;
+    } }),
+    messageId: record.messageId,
+    pollIntervalMilliseconds: 10,
+    waitMinutes: 0.01,
+  });
+  assert.equal(reads, 2);
+  assert.equal(result.outcome, "replied");
+});
+
+test("wait reports unknown when receipt lock contention lasts through its deadline", async () => {
+  const record = statusRecord();
+  let elapsedMilliseconds = 0;
+  const result = await waitForMessageStatus({
+    store: fakeStore([], { get: async () => { throw new MessageStatusLockTimeoutError(); } }),
+    messageId: record.messageId,
+    waitMinutes: 0.01,
+    currentDate: () => new Date(Date.parse(timestamp) + (elapsedMilliseconds += 600)),
+    inspectSessions: async () => { assert.fail("Unavailable receipts are not evidence for delivery diagnosis"); },
+  });
+  assert.deepEqual(result, { outcome: "unknown", reason: "receipt_lock_timeout" });
+});
+
+test("wait reports unknown if receipt access times out after diagnosis instead of returning stale status", async () => {
+  const record = statusRecord();
+  let reads = 0;
+  let elapsedMilliseconds = 0;
+  const result = await waitForMessageStatus({
+    store: fakeStore([], { get: async () => {
+      if (++reads > 1) throw new MessageStatusLockTimeoutError();
+      return record;
+    } }),
+    messageId: record.messageId,
+    waitMinutes: 0.01,
+    currentDate: () => new Date(Date.parse(timestamp) + (elapsedMilliseconds += 600)),
+    inspectSessions: async () => [activeSession(codexAddress)],
+  });
+  assert.deepEqual(result, { outcome: "unknown", reason: "receipt_lock_timeout" });
+});
+
+test("wait propagates receipt corruption and aborts during contention", async () => {
+  const record = statusRecord();
+  const corruption = new SyntaxError("Invalid receipt JSON");
+  await assert.rejects(waitForMessageStatus({
+    store: fakeStore([], { get: async () => { throw corruption; } }),
+    messageId: record.messageId,
+  }), (error) => error === corruption);
+  const controller = new AbortController();
+  await assert.rejects(waitForMessageStatus({
+    store: fakeStore([], { get: async () => {
+      controller.abort();
+      throw new MessageStatusLockTimeoutError();
+    } }),
+    messageId: record.messageId,
+    signal: controller.signal,
+  }), { name: "AbortError" });
 });
 
 test("wait returns missing status and respects abort while entering a polling delay", async () => {

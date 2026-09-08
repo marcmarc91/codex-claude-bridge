@@ -6,6 +6,7 @@ import { inspectActiveSessionsReadOnly } from "../install/readOnlySessionInspect
 import type { AgentAddress } from "../protocol/messageEnvelope.js";
 import type { ActiveSessionRecord } from "../registry/activeSessionRegistry.js";
 import {
+  MessageStatusLockTimeoutError,
   resolveMessageTimeoutMinutes,
   type MessageStatusRecord,
   type MessageStatusStore,
@@ -95,7 +96,8 @@ export interface WaitForMessageOptions extends DiagnoseMessageOptions {
 
 export async function waitForMessageStatus(options: WaitForMessageOptions): Promise<{
   status?: MessageStatusRecord;
-  outcome: "seen" | "replied" | "overdue" | "missing";
+  outcome: "seen" | "replied" | "overdue" | "missing" | "unknown";
+  reason?: "receipt_lock_timeout";
   diagnosis?: MessageDeliveryDiagnosis;
 }> {
   const waitMinutes = resolveMessageTimeoutMinutes(options.waitMinutes);
@@ -104,9 +106,25 @@ export async function waitForMessageStatus(options: WaitForMessageOptions): Prom
   const currentDate = options.currentDate ?? (() => new Date());
   const deadline = currentDate().getTime() + waitMinutes * 60_000;
   if (!Number.isFinite(deadline)) throw new Error("Wait clock is invalid");
+  const readStatusUntilDeadline = async (): Promise<MessageStatusRecord | undefined | null> => {
+    for (;;) {
+      options.signal?.throwIfAborted();
+      try {
+        return await options.store.get(options.messageId);
+      } catch (error) {
+        if (!(error instanceof MessageStatusLockTimeoutError)) throw error;
+        options.signal?.throwIfAborted();
+        const remainingMilliseconds = deadline - currentDate().getTime();
+        if (!Number.isFinite(remainingMilliseconds)) throw new Error("Wait clock is invalid");
+        if (remainingMilliseconds <= 0) return null;
+        await delay(Math.min(pollInterval, remainingMilliseconds), undefined, { signal: options.signal });
+      }
+    }
+  };
   for (;;) {
     options.signal?.throwIfAborted();
-    const status = await options.store.get(options.messageId);
+    const status = await readStatusUntilDeadline();
+    if (status === null) return { outcome: "unknown", reason: "receipt_lock_timeout" };
     if (status === undefined) return { outcome: "missing" };
     if (status.state === "replied" || (until === "seen" && status.state === "seen")) {
       return { status, outcome: status.state };
@@ -115,7 +133,8 @@ export async function waitForMessageStatus(options: WaitForMessageOptions): Prom
     if (!Number.isFinite(remainingMilliseconds)) throw new Error("Wait clock is invalid");
     if (remainingMilliseconds <= 0) {
       const diagnosis = await diagnoseMessageDelivery(status, options);
-      const latestStatus = await options.store.get(options.messageId);
+      const latestStatus = await readStatusUntilDeadline();
+      if (latestStatus === null) return { outcome: "unknown", reason: "receipt_lock_timeout" };
       if (latestStatus?.state === "replied" || (until === "seen" && latestStatus?.state === "seen")) {
         return { status: latestStatus, outcome: latestStatus.state };
       }

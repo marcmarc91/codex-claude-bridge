@@ -3,24 +3,28 @@ import { pathToFileURL } from "node:url";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 
-import {
-  readOwningClaudeSessionMetadata,
-  type ClaudeSessionMetadata,
-} from "../channel/claudeSessionMetadata.js";
+import { readOwningClaudeSessionMetadata } from "../channel/claudeSessionMetadata.js";
 import { registerActiveSession, unregisterActiveSession } from "../registry/activeSessionRegistry.js";
 import { resolveProjectIdentity } from "../registry/projectIdentity.js";
 import { uuidSchema } from "../protocol/messageEnvelope.js";
+import {
+  identifyHookHostRuntime,
+  type HookHostRuntimeIdentifiers,
+  type OwningClaudeSessionReader,
+} from "./hookHostRuntime.js";
 
 interface CodexSessionHookInput {
   hook_event_name: "SessionStart" | "SessionEnd";
   session_id: string;
   cwd: string;
+  transcript_path?: string | null;
 }
 
 const codexSessionHookInputSchema = z.object({
   hook_event_name: z.enum(["SessionStart", "SessionEnd"]),
   session_id: uuidSchema,
   cwd: z.string().refine((value) => isAbsolute(value) && !value.includes("\0")),
+  transcript_path: z.string().nullish(),
 }).passthrough();
 
 export const maximumCodexSessionHookInputUtf8Bytes = 1_048_576;
@@ -30,45 +34,33 @@ function parseCodexSessionHookInput(input: unknown): CodexSessionHookInput | und
   return parsedInput.success ? parsedInput.data : undefined;
 }
 
-export type OwningClaudeSessionReader = (
-  parentProcessIdentifier: number,
-) => Promise<ClaudeSessionMetadata>;
-
-async function hookInvocationBelongsToClaudeCodeSession(
-  sessionId: string,
-  parentProcessIdentifier: number,
-  readOwningClaudeSession: OwningClaudeSessionReader,
-): Promise<boolean> {
-  try {
-    const owningClaudeSession = await readOwningClaudeSession(parentProcessIdentifier);
-    return owningClaudeSession.sessionId === sessionId;
-  } catch {
-    return false;
-  }
-}
+export type { OwningClaudeSessionReader };
 
 export async function runCodexSessionHook(
   input: unknown,
   readOwningClaudeSession: OwningClaudeSessionReader = readOwningClaudeSessionMetadata,
+  hostRuntimeIdentifiers: Omit<HookHostRuntimeIdentifiers, "readOwningClaudeSession"> = {},
 ): Promise<void> {
   const hookInput = parseCodexSessionHookInput(input);
   if (hookInput === undefined) {
     return;
   }
 
-  if (
-    await hookInvocationBelongsToClaudeCodeSession(
-      hookInput.session_id,
-      process.ppid,
-      readOwningClaudeSession,
-    )
-  ) {
-    return;
-  }
-
   const projectId = await resolveProjectIdentity(hookInput.cwd);
   if (hookInput.hook_event_name === "SessionEnd") {
     await unregisterActiveSession(hookInput.session_id, projectId, process.ppid);
+    return;
+  }
+
+  const hookHostRuntime = await identifyHookHostRuntime(
+    {
+      sessionId: hookInput.session_id,
+      parentProcessIdentifier: process.ppid,
+      transcriptPath: hookInput.transcript_path ?? undefined,
+    },
+    { ...hostRuntimeIdentifiers, readOwningClaudeSession },
+  );
+  if (hookHostRuntime !== "codex") {
     return;
   }
 

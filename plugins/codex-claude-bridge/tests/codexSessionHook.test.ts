@@ -138,6 +138,7 @@ test("hook-ul Codex înregistrează și elimină numai sesiunea specificată", a
     model: "gpt-5.6-sol",
     permission_mode: "default",
     source: "startup",
+    transcript_path: "/Users/codex-user/.codex/sessions/rollout-test.jsonl",
   };
 
   await runCodexSessionHook({ ...sessionStartInput, session_id: firstSessionIdentifier });
@@ -162,7 +163,15 @@ test("entrypoint-ul compilat execută hook-ul din manifest fără stdout și ign
   await executeFile(join(pluginDirectory, "node_modules/.bin/tsc"), ["-p", "tsconfig.json"], { cwd: pluginDirectory });
   const sessionId = "ad65b1c1-7386-4465-80f9-4de0a26bc212";
   const workingDirectory = process.cwd();
-  const invocation = await invokeHookEntry({ hook_event_name: "SessionStart", session_id: sessionId, cwd: workingDirectory }, stateHomeDirectory);
+  const invocation = await invokeHookEntry(
+    {
+      hook_event_name: "SessionStart",
+      session_id: sessionId,
+      cwd: workingDirectory,
+      transcript_path: "/Users/codex-user/.codex/sessions/rollout-entrypoint-test.jsonl",
+    },
+    stateHomeDirectory,
+  );
   assert.equal(invocation.exitCode, 0);
   assert.equal(invocation.standardOutput, "");
   assert.equal((await listActiveSessions({ runtime: "codex", projectId: await resolveProjectIdentity(workingDirectory) }, stateHomeDirectory))[0]?.sessionId, sessionId);
@@ -226,7 +235,7 @@ test("comenzile manifestului rulează dintr-un cache fără dependențe și păs
       model: "gpt-5.6-sol",
       permission_mode: "default",
       source: "startup",
-      transcript_path: null,
+      transcript_path: "/Users/codex-user/.codex/sessions/rollout-manifest-test.jsonl",
     }),
     stateHomeDirectory,
     workingDirectory,
@@ -278,7 +287,9 @@ test("comenzile manifestului rulează dintr-un cache fără dependențe și păs
   );
 });
 
-test("hook-ul nu înregistrează sesiunile deținute de Claude Code", async (testContext) => {
+async function withIsolatedStateHomeDirectory(
+  testContext: test.TestContext,
+): Promise<string> {
   const stateHomeDirectory = await mkdtemp(join(tmpdir(), "codex-claude-bridge-"));
   const originalStateHomeDirectory = process.env.XDG_STATE_HOME;
   process.env.XDG_STATE_HOME = stateHomeDirectory;
@@ -290,6 +301,15 @@ test("hook-ul nu înregistrează sesiunile deținute de Claude Code", async (tes
     }
     await rm(stateHomeDirectory, { recursive: true, force: true });
   });
+  return stateHomeDirectory;
+}
+
+async function failingOwningClaudeSessionReader(): Promise<never> {
+  throw new Error("metadata indisponibilă");
+}
+
+test("hook-ul nu înregistrează sesiunile deținute de Claude Code când metadata se potrivește", async (testContext) => {
+  await withIsolatedStateHomeDirectory(testContext);
 
   const claudeSessionIdentifier = "7b2f8c31-4d5a-4e6b-9c0d-1a2b3c4d5e6f";
   const workingDirectory = process.cwd();
@@ -306,12 +326,125 @@ test("hook-ul nu înregistrează sesiunile deținute de Claude Code", async (tes
     name: "claude-session",
     cwd: workingDirectory,
   }));
-  assert.deepEqual(await listActiveSessions({ projectId: projectIdentifier }), []);
 
-  await runCodexSessionHook(sessionStartInput, async () => {
-    throw new Error("metadata indisponibilă");
+  assert.deepEqual(await listActiveSessions({ projectId: projectIdentifier }), []);
+});
+
+test("hook-ul nu înregistrează un subagent Claude Code când metadata eșuează dar procesul părinte este claude", async (testContext) => {
+  await withIsolatedStateHomeDirectory(testContext);
+
+  const sessionIdentifier = "7b2f8c31-4d5a-4e6b-9c0d-1a2b3c4d5e6f";
+  const workingDirectory = process.cwd();
+  const projectIdentifier = await resolveProjectIdentity(workingDirectory);
+  const sessionStartInput = {
+    hook_event_name: "SessionStart",
+    session_id: sessionIdentifier,
+    cwd: workingDirectory,
+  };
+
+  await runCodexSessionHook(sessionStartInput, failingOwningClaudeSessionReader, {
+    readParentProcessCommandLine: async () => "/opt/homebrew/bin/claude",
+    environment: {},
   });
+
+  assert.deepEqual(await listActiveSessions({ projectId: projectIdentifier }), []);
+});
+
+test("hook-ul înregistrează sesiunea ca 'codex' când metadata eșuează dar procesul părinte este binarul codex", async (testContext) => {
+  await withIsolatedStateHomeDirectory(testContext);
+
+  const sessionIdentifier = "5a6f9c31-4d5a-4e6b-9c0d-1a2b3c4d5eab";
+  const workingDirectory = process.cwd();
+  const projectIdentifier = await resolveProjectIdentity(workingDirectory);
+  const sessionStartInput = {
+    hook_event_name: "SessionStart",
+    session_id: sessionIdentifier,
+    cwd: workingDirectory,
+  };
+
+  await runCodexSessionHook(sessionStartInput, failingOwningClaudeSessionReader, {
+    readParentProcessCommandLine: async () => "/Users/marc/.local/bin/codex",
+    environment: {},
+  });
+
   const registeredSessions = await listActiveSessions({ projectId: projectIdentifier });
   assert.equal(registeredSessions.length, 1);
   assert.equal(registeredSessions[0]?.runtime, "codex");
+});
+
+test("hook-ul înregistrează sesiunea ca 'codex' pornind de la transcript_path sub .codex când procesul părinte e necunoscut", async (testContext) => {
+  await withIsolatedStateHomeDirectory(testContext);
+
+  const sessionIdentifier = "1234abcd-4d5a-4e6b-9c0d-1a2b3c4d5eab";
+  const workingDirectory = process.cwd();
+  const projectIdentifier = await resolveProjectIdentity(workingDirectory);
+  const sessionStartInput = {
+    hook_event_name: "SessionStart",
+    session_id: sessionIdentifier,
+    cwd: workingDirectory,
+    transcript_path: "/Users/marc/.codex/sessions/2026/09/rollout-abc.jsonl",
+  };
+
+  await runCodexSessionHook(sessionStartInput, failingOwningClaudeSessionReader, {
+    readParentProcessCommandLine: async () => undefined,
+    environment: {},
+  });
+
+  const registeredSessions = await listActiveSessions({ projectId: projectIdentifier });
+  assert.equal(registeredSessions.length, 1);
+  assert.equal(registeredSessions[0]?.runtime, "codex");
+});
+
+test("hook-ul dezînregistrează la SessionEnd chiar dacă acel invocare este identificată drept 'claude'", async (testContext) => {
+  await withIsolatedStateHomeDirectory(testContext);
+
+  const sessionIdentifier = "3344abcd-4d5a-4e6b-9c0d-1a2b3c4d5eab";
+  const workingDirectory = process.cwd();
+  const projectIdentifier = await resolveProjectIdentity(workingDirectory);
+
+  await runCodexSessionHook(
+    {
+      hook_event_name: "SessionStart",
+      session_id: sessionIdentifier,
+      cwd: workingDirectory,
+      transcript_path: "/Users/marc/.codex/sessions/rollout-end-test.jsonl",
+    },
+    failingOwningClaudeSessionReader,
+    { readParentProcessCommandLine: async () => undefined, environment: {} },
+  );
+  assert.equal((await listActiveSessions({ projectId: projectIdentifier })).length, 1);
+
+  await runCodexSessionHook(
+    { hook_event_name: "SessionEnd", session_id: sessionIdentifier, cwd: workingDirectory },
+    failingOwningClaudeSessionReader,
+    {
+      readParentProcessCommandLine: async () => undefined,
+      environment: { CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "some-session" },
+    },
+  );
+
+  assert.deepEqual(await listActiveSessions({ projectId: projectIdentifier }), []);
+});
+
+test("hook-ul nu înregistrează și nu aruncă nicio eroare când toate dovezile despre rulanță sunt necunoscute", async (testContext) => {
+  await withIsolatedStateHomeDirectory(testContext);
+
+  const sessionIdentifier = "9988abcd-4d5a-4e6b-9c0d-1a2b3c4d5eab";
+  const workingDirectory = process.cwd();
+  const projectIdentifier = await resolveProjectIdentity(workingDirectory);
+  const sessionStartInput = {
+    hook_event_name: "SessionStart",
+    session_id: sessionIdentifier,
+    cwd: workingDirectory,
+    transcript_path: null,
+  };
+
+  await assert.doesNotReject(
+    runCodexSessionHook(sessionStartInput, failingOwningClaudeSessionReader, {
+      readParentProcessCommandLine: async () => undefined,
+      environment: {},
+    }),
+  );
+
+  assert.deepEqual(await listActiveSessions({ projectId: projectIdentifier }), []);
 });

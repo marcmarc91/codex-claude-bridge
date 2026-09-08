@@ -39,6 +39,6 @@ Task messages are not retransmitted automatically. The bridge never guesses anot
 
 ## Storage and limits
 
-Receipts are private, bounded metadata under the bridge state directory. They contain routes, timestamps, state, message type, and a content digest, not message bodies. The default store accepts at most 512 unexpired records and retains records for 24 hours after their deadline. Expired records are pruned lazily. When capacity is exhausted, the bridge refuses new receipt creation instead of silently discarding outstanding records.
+Receipts are private, bounded metadata under the bridge state directory. They contain routes, timestamps, state, message type, and a content digest, not message bodies. The default store accepts at most 512 unexpired records and retains records for up to 24 hours after their deadline. Expired records are pruned lazily. At capacity, the oldest completed records are evicted first: replied messages, definite transport failures, and explicitly seen informational messages or replies. Questions and handoffs that are only seen remain outstanding. If all records are outstanding, new receipt creation is refused; uncertain deliveries are never discarded to make room. An evicted receipt is no longer available to status queries.
 
 Updates use one persistent store lock and atomic replacement. Do not delete lock files to clear a problem: removing a locked inode can let independent writers enter the same critical section. Runtime transcripts and native queues have their own retention policies outside this receipt store.

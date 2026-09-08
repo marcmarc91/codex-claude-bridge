@@ -222,6 +222,48 @@ test("independent stores preserve concurrent acceptance and acknowledgment", asy
   assert.equal(status?.acknowledgedAt, initialTimestamp);
 });
 
+test("capacity evicts the oldest completed receipt without discarding unanswered questions", async (testContext) => {
+  const fixture = await createTestState(testContext);
+  const store = createMessageStatusStore({ ...fixture.storeOptions, maximumRecords: 4 });
+  const question = messageEnvelope(1);
+  const reply = messageEnvelope(2, { messageType: "reply", sender: claudeAddress, recipient: codexAddress });
+  await store.createPending(question);
+  await store.markSeen(question.messageId, claudeAddress);
+  await store.createPending(reply);
+  await store.markAccepted(reply.messageId);
+  await store.markReplied(question.messageId, claudeAddress, reply.messageId);
+  fixture.advance(1_000);
+  const information = messageEnvelope(3, { messageType: "message" });
+  await store.createPending(information);
+  await store.markSeen(information.messageId, claudeAddress);
+  const unanswered = messageEnvelope(4);
+  await store.createPending(unanswered);
+  await store.markSeen(unanswered.messageId, claudeAddress);
+  await store.createPending(messageEnvelope(5));
+  assert.equal(await store.get(question.messageId), undefined);
+  assert.equal((await store.get(information.messageId))?.state, "seen");
+  assert.equal((await store.get(unanswered.messageId))?.state, "seen");
+  await store.createPending(messageEnvelope(6));
+  assert.equal(await store.get(information.messageId), undefined);
+  await assert.rejects(store.createPending(messageEnvelope(7)), /capacity/);
+  assert.equal((await store.get(unanswered.messageId))?.state, "seen");
+  await store.markSeen(reply.messageId, codexAddress);
+  await store.createPending(messageEnvelope(7));
+  assert.equal(await store.get(reply.messageId), undefined);
+});
+
+test("capacity reclaims definite failures but preserves uncertain delivery", async (testContext) => {
+  const fixture = await createTestState(testContext);
+  const store = createMessageStatusStore({ ...fixture.storeOptions, maximumRecords: 2 });
+  await store.createPending(messageEnvelope(1));
+  await store.markTransportFailure(messageIdentifier(1), "unknown");
+  await store.createPending(messageEnvelope(2));
+  await store.markTransportFailure(messageIdentifier(2), "failed");
+  await store.createPending(messageEnvelope(3));
+  assert.equal(await store.get(messageIdentifier(2)), undefined);
+  assert.equal((await store.get(messageIdentifier(1)))?.transportState, "unknown");
+});
+
 test("independent stores enforce the global capacity atomically", async (testContext) => {
   const fixture = await createTestState(testContext);
   const firstStore = createMessageStatusStore({ ...fixture.storeOptions, maximumRecords: 1 });

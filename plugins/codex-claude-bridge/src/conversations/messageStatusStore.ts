@@ -226,7 +226,15 @@ export function createMessageStatusStore(options: CreateMessageStatusStoreOption
           if (existing.contentDigest !== contentDigest) throw new Error("Message identifier is already bound to another envelope");
           return publicStatus(existing);
         }
-        if (records.length >= maximumRecords) throw new Error("Message status capacity is exhausted");
+        while (records.length >= maximumRecords) {
+          const oldestCompletedRecord = records.filter((candidate) =>
+            candidate.repliedAt !== undefined || candidate.transportState === "failed" ||
+            ((candidate.messageType === "message" || candidate.messageType === "reply") &&
+              candidate.acknowledgedAt !== undefined),
+          ).sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))[0];
+          if (oldestCompletedRecord === undefined) throw new Error("Message status capacity is exhausted by outstanding messages");
+          records.splice(records.indexOf(oldestCompletedRecord), 1);
+        }
         const record: StoredMessageStatus = {
           messageId,
           conversationId: normalizeMessageId(envelope.conversationId),

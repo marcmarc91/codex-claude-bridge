@@ -1,13 +1,18 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import test from "node:test";
 
-import { deliverClaudeMessage } from "../src/channel/channelSocketClient.js";
+import {
+  ChannelTransportError,
+  deliverClaudeMessage,
+} from "../src/channel/channelSocketClient.js";
 import type { ChannelDeliveryResponse } from "../src/channel/channelSocketServer.js";
 import type { AgentMessageEnvelope } from "../src/protocol/messageEnvelope.js";
 import {
+  activeSessionRegistrationIsOwned,
   listActiveSessions,
   registerActiveSession,
   type ActiveSessionRecord,
@@ -174,7 +179,7 @@ test("returns a strict negative acknowledgement without removing a live target",
   );
 });
 
-test("rejects mismatched, malformed, oversized, and multiple response frames", async (testContext) => {
+test("rejects invalid response frames without removing a live target", async (testContext) => {
   const invalidResponses = [
     `${JSON.stringify({ delivered: true, messageId: "ea7220bc-cd1e-41f0-bf7f-413982f18a9c" })}\n`,
     "not-json\n",
@@ -205,13 +210,14 @@ test("rejects mismatched, malformed, oversized, and multiple response frames", a
 
     assert.deepEqual(
       await listActiveSessions({ runtime: "claude" }, stateHomeDirectory),
-      [],
+      [record],
     );
   }
 });
 
-test("bounds an unresponsive target and removes its exact stale generation", async (testContext) => {
+test("preserves a slow target and permits a later delivery without registration", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  let shouldAcknowledgeDelivery = false;
   let observeConnection: (() => void) | undefined;
   const connectionAccepted = new Promise<void>((resolveConnection) => {
     observeConnection = resolveConnection;
@@ -223,21 +229,73 @@ test("bounds an unresponsive target and removes its exact stale generation", asy
     (socket) => {
       observeConnection?.();
       socket.resume();
+      socket.once("end", () => {
+        if (shouldAcknowledgeDelivery) {
+          socket.end(`${JSON.stringify({ delivered: true, messageId: messageIdentifier })}\n`);
+        }
+      });
     },
   );
-  const staleRecord = await registerTarget(stateHomeDirectory, socketPath);
+  const slowTargetRecord = await registerTarget(stateHomeDirectory, socketPath);
   const delivery = deliverClaudeMessage({
-    targetSession: staleRecord,
+    targetSession: slowTargetRecord,
     envelope: messageEnvelope(),
     stateHomeDirectory,
     timeoutMilliseconds: 30,
   });
   await connectionAccepted;
 
-  await assert.rejects(delivery, /timed out/u);
+  await assert.rejects(delivery, (error: unknown) =>
+    error instanceof ChannelTransportError && error.code === "TIMEOUT",
+  );
   assert.deepEqual(
     await listActiveSessions({ runtime: "claude" }, stateHomeDirectory),
-    [],
+    [slowTargetRecord],
+  );
+  shouldAcknowledgeDelivery = true;
+  assert.deepEqual(
+    await deliverClaudeMessage({
+      targetSession: slowTargetRecord,
+      envelope: messageEnvelope(),
+      stateHomeDirectory,
+    }),
+    { delivered: true, messageId: messageIdentifier },
+  );
+});
+
+test("reports connection refusal distinctly and removes the unavailable generation", async (testContext) => {
+  const stateHomeDirectory = await createStateHomeDirectory(testContext);
+  const socketsDirectory = join(
+    resolveBridgeStateDirectory(stateHomeDirectory),
+    "sockets",
+  );
+  await mkdir(socketsDirectory, { recursive: true, mode: 0o700 });
+  const socketPath = join(socketsDirectory, "refused.sock");
+  const socketCreator = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      "require('node:net').createServer().listen(process.argv[1], () => process.exit(0))",
+      socketPath,
+    ],
+    { timeout: 5_000 },
+  );
+  assert.equal(socketCreator.status, 0);
+  await chmod(socketPath, 0o600);
+  const unavailableTargetRecord = await registerTarget(stateHomeDirectory, socketPath);
+
+  await assert.rejects(
+    deliverClaudeMessage({
+      targetSession: unavailableTargetRecord,
+      envelope: messageEnvelope(),
+      stateHomeDirectory,
+    }),
+    (error: unknown) =>
+      error instanceof ChannelTransportError && error.code === "ECONNREFUSED",
+  );
+  assert.equal(
+    await activeSessionRegistrationIsOwned(unavailableTargetRecord, stateHomeDirectory),
+    false,
   );
 });
 

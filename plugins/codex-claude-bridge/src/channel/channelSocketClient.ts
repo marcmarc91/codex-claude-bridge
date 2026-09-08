@@ -36,6 +36,16 @@ const maximumResponseErrorUtf8Bytes = 4_096;
 const defaultTimeoutMilliseconds = 5_000;
 const strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
+export class ChannelTransportError extends Error {
+  constructor(
+    readonly code: "TIMEOUT" | "ECONNREFUSED" | "ENOENT" | "TRANSPORT_ERROR",
+    message: string,
+  ) {
+    super(message);
+    this.name = "ChannelTransportError";
+  }
+}
+
 class ChannelDeliveryAbortedError extends Error {
   constructor() {
     super("Channel delivery aborted");
@@ -163,7 +173,10 @@ function exchangeSingleFrame(
     };
     const abortExchange = () => settle(new ChannelDeliveryAbortedError());
     const timeoutHandle = setTimeout(
-      () => settle(new Error("Channel delivery timed out")),
+      () => settle(new ChannelTransportError(
+        "TIMEOUT",
+        "Channel delivery timed out; delivery status is unknown",
+      )),
       timeoutMilliseconds,
     );
 
@@ -197,8 +210,23 @@ function exchangeSingleFrame(
         settle(error instanceof Error ? error : new Error("Invalid Channel response"));
       }
     });
-    socket.once("error", () => {
-      settle(new Error("Claude Channel transport failed"));
+    socket.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "ECONNREFUSED") {
+        settle(new ChannelTransportError(
+          "ECONNREFUSED",
+          "Claude Channel connection refused",
+        ));
+      } else if (error.code === "ENOENT") {
+        settle(new ChannelTransportError(
+          "ENOENT",
+          "Claude Channel socket is missing",
+        ));
+      } else {
+        settle(new ChannelTransportError(
+          "TRANSPORT_ERROR",
+          "Claude Channel transport failed; delivery status is unknown",
+        ));
+      }
     });
     socket.once("close", () => {
       if (!settled) {
@@ -264,7 +292,8 @@ export async function deliverClaudeMessage(
       options.signal,
     );
   } catch (error) {
-    if (!(error instanceof ChannelDeliveryAbortedError)) {
+    const errorCode = (error as NodeJS.ErrnoException).code;
+    if (errorCode === "ECONNREFUSED" || errorCode === "ENOENT") {
       await unregisterActiveSessionGeneration(
         options.targetSession,
         options.stateHomeDirectory,

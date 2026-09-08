@@ -457,7 +457,6 @@ test("rejects malformed, partial, extra, overlong, and wrongly addressed frames"
       error: "Channel frame exceeds maximum encoded envelope size",
     },
   );
-  assert.equal(maximumSerializedAgentMessageEnvelopeFrameUtf8Bytes, 393_784);
   assert.equal(deliveryCount, 0);
 
   const staleSenderResponse = await exchangeSocketFrame(

@@ -18,11 +18,12 @@ codex-claude-bridge@codex-claude-bridge-local
 
 ## Claude tools
 
-The Channel exposes exactly three tools:
+The Channel exposes four tools:
 
 - `list_codex_sessions(project?: string)` lists active local Codex sessions, optionally filtered by an absolute project path.
 - `send_to_codex(session_id: string, message_type: string, content: string)` queues a message to one explicit active Codex UUID.
-- `reply_to_codex(conversation_id: string, content: string)` replies over an active correlated route.
+- `reply_to_codex(conversation_id: string, content: string, reply_to_message_id?: string)` replies over an active correlated route. Include the inbound message ID when multiple messages share a conversation.
+- `acknowledge_message(message_id: string)` explicitly records that the receiving Claude agent has seen the message.
 
 There is no permission tool and no broadcast fallback. Claude-to-Codex delivery delegates wake-up to `codex queue`.
 
@@ -43,7 +44,7 @@ The Codex hook and Claude MCP manifests invoke `codex-claude-bridge` from `PATH`
 
 Messages use strict UUID-based envelopes, canonical UTC timestamps, explicit sender and recipient addresses, and at most 65,536 UTF-8 bytes of content. Unknown envelope fields are rejected. Replies retain the conversation UUID and reverse the route.
 
-A successful send or reply is a transport acknowledgement only. Model work and model replies are separate events.
+A successful send or reply initially confirms transport acceptance only. Persistent receipts separately track explicit agent acknowledgement and correlated replies. See [delivery and timeout semantics](../../docs/delivery-and-timeouts.md). A reply is not evidence that the requested work passed verification.
 
 ## Runtime boundary
 

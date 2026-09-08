@@ -1,8 +1,17 @@
 {
   "name": "codex-claude-bridge-workspace",
   "private": true,
+  "description": "Development workspace for the local Codex and Claude Code session bridge.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/marcmarc91/codex-claude-bridge.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
   "packageManager": "pnpm@9.15.4",
   "scripts": {
+    "bootstrap": "pnpm install --frozen-lockfile && pnpm build && pnpm --filter codex-claude-bridge bridge setup",
     "build": "pnpm --filter codex-claude-bridge build",
     "check": "pnpm --filter codex-claude-bridge check",
     "test": "pnpm --filter codex-claude-bridge test",

@@ -2,6 +2,21 @@
   "name": "codex-claude-bridge",
   "version": "0.1.1",
   "private": true,
+  "description": "Local session messaging, acknowledgements and delivery diagnostics for Codex and Claude Code.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/marcmarc91/codex-claude-bridge.git",
+    "directory": "plugins/codex-claude-bridge"
+  },
+  "homepage": "https://github.com/marcmarc91/codex-claude-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/marcmarc91/codex-claude-bridge/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "os": ["darwin"],
+  "keywords": ["codex", "claude-code", "mcp", "agent-messaging"],
   "type": "module",
   "bin": {
     "codex-claude-bridge": "dist/bin/codexClaudeBridge.js",

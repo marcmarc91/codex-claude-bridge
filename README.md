@@ -8,7 +8,7 @@ The bridge uses supported runtime entry points:
 - Claude sends to Codex through `codex queue`.
 - Claude-to-Claude communication remains on Claude Code's native `ListAgents` and `SendMessage` tools.
 
-There is no daemon, scheduler, polling loop, TCP listener, broadcast, or bridge-owned offline queue. Only sessions that are currently running can receive messages.
+There is no standalone daemon, TCP listener, broadcast, or bridge-owned offline queue. Only sessions that are currently running can receive messages. The Claude Channel monitors outstanding messages during its own lifetime; an explicitly waiting CLI command can poll delivery receipts without leaving a background process behind.
 
 ## Requirements
 
@@ -196,6 +196,8 @@ codex-claude-bridge uninstall --global --confirm-pending-command-stopped
 Do not use this flag preemptively. It can recover an unconfirmed command for which no process-group identifier was captured, but only on the user's explicit assertion that the process stopped. A known process group that is still active cannot be bypassed. A known process group that is no longer active is detected and recovered automatically. Do not edit or delete the receipt manually.
 
 ## State and security boundary
+
+Message receipts distinguish transport acceptance, explicit agent acknowledgement, and a correlated reply. None of these states proves that the requested work succeeded. See [delivery and timeout semantics](docs/delivery-and-timeouts.md) for the state model, monitoring limits, and safe recovery policy.
 
 Bridge state is stored below `${XDG_STATE_HOME:-~/.local/state}/codex-claude-bridge`. Directories use mode `0700`; records, locks, receipts, and sockets use mode `0600`.
 

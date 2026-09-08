@@ -256,7 +256,7 @@ test("resolveBridgeStateDirectory propagă mediul injectat către rezolvarea XDG
   );
 });
 
-test("resolveSocketsDirectory folosește <stateDir>/sockets fără CODEX_CLAUDE_BRIDGE_SOCKET_DIR", () => {
+test("resolveSocketsDirectory folosește <stateDir>/sockets sub directorul de stare", () => {
   const stateHomeDirectory = join(tmpdir(), "ccb-sockets-default-state");
 
   assert.equal(
@@ -265,45 +265,14 @@ test("resolveSocketsDirectory folosește <stateDir>/sockets fără CODEX_CLAUDE_
   );
 });
 
-test("resolveSocketsDirectory tratează CODEX_CLAUDE_BRIDGE_SOCKET_DIR gol ca absent", () => {
-  const stateHomeDirectory = join(tmpdir(), "ccb-sockets-empty-override-state");
-
-  assert.equal(
-    resolveSocketsDirectory(stateHomeDirectory, { CODEX_CLAUDE_BRIDGE_SOCKET_DIR: "" }),
-    join(stateHomeDirectory, "codex-claude-bridge", "sockets"),
-  );
-});
-
-test("resolveSocketsDirectory respectă CODEX_CLAUDE_BRIDGE_SOCKET_DIR absolut", () => {
-  const stateHomeDirectory = join(tmpdir(), "ccb-sockets-override-state");
-  const socketDirectoryOverride = join(tmpdir(), "ccb-sockets-override-target");
-
-  assert.equal(
-    resolveSocketsDirectory(stateHomeDirectory, {
-      CODEX_CLAUDE_BRIDGE_SOCKET_DIR: socketDirectoryOverride,
-    }),
-    socketDirectoryOverride,
-  );
-});
-
-test("resolveSocketsDirectory respinge CODEX_CLAUDE_BRIDGE_SOCKET_DIR relativ sau cu NUL fără a reveni la directorul implicit", () => {
-  const stateHomeDirectory = join(tmpdir(), "ccb-sockets-invalid-override-state");
-
-  for (const invalidSocketDirectoryOverride of ["relative-sockets", "  ", "/tmp/invalid\0sockets"]) {
-    assert.throws(
-      () =>
-        resolveSocketsDirectory(stateHomeDirectory, {
-          CODEX_CLAUDE_BRIDGE_SOCKET_DIR: invalidSocketDirectoryOverride,
-        }),
-      TypeError,
-    );
-  }
-});
-
 test("assertSocketPathWithinLimit acceptă căi în limita de octeți UTF-8", () => {
   const shortSocketPath = join(tmpdir(), "c-0123456789abcdef.sock");
+  const exactLimitSocketPath = `/${"é".repeat(51)}`;
 
+  assert.equal(Buffer.byteLength(exactLimitSocketPath, "utf8"), maximumChannelSocketPathUtf8Bytes);
   assert.doesNotThrow(() => assertSocketPathWithinLimit(shortSocketPath));
+  assert.doesNotThrow(() => assertSocketPathWithinLimit(exactLimitSocketPath));
+  assert.throws(() => assertSocketPathWithinLimit(`${exactLimitSocketPath}a`), RangeError);
 });
 
 test("assertSocketPathWithinLimit aruncă RangeError cu limita, lungimea efectivă și variabila de remediu", () => {
@@ -321,7 +290,7 @@ test("assertSocketPathWithinLimit aruncă RangeError cu limita, lungimea efectiv
       const message = (error as Error).message;
       assert.ok(message.includes(String(maximumChannelSocketPathUtf8Bytes)));
       assert.ok(message.includes(String(expectedByteLength)));
-      assert.ok(message.includes("CODEX_CLAUDE_BRIDGE_SOCKET_DIR"));
+      assert.ok(message.includes("XDG_STATE_HOME"));
       return true;
     },
   );

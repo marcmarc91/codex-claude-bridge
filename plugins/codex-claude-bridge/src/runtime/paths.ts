@@ -7,7 +7,6 @@ import { uuidSchema } from "../protocol/messageEnvelope.js";
 export const projectIdentitySchema = z.string().regex(/^[a-f0-9]{24}$/);
 
 export const maximumChannelSocketPathUtf8Bytes = 103;
-const socketDirectoryOverrideEnvironmentVariableName = "CODEX_CLAUDE_BRIDGE_SOCKET_DIR";
 
 function validateStateHomeDirectory(stateHomeDirectory: string): string {
   if (!isAbsolute(stateHomeDirectory) || stateHomeDirectory.includes("\0")) {
@@ -80,16 +79,6 @@ export function resolveSocketsDirectory(
   stateHomeDirectory?: string,
   environment: NodeJS.ProcessEnv = process.env,
 ): string {
-  const socketDirectoryOverride = environment[socketDirectoryOverrideEnvironmentVariableName];
-  if (socketDirectoryOverride !== undefined && socketDirectoryOverride.length > 0) {
-    if (!isAbsolute(socketDirectoryOverride) || socketDirectoryOverride.includes("\0")) {
-      throw new TypeError(
-        `${socketDirectoryOverrideEnvironmentVariableName} must be an absolute path without NUL bytes`,
-      );
-    }
-    return resolve(socketDirectoryOverride);
-  }
-
   return resolveContainedDirectory(
     resolveBridgeStateDirectory(stateHomeDirectory, environment),
     "sockets",
@@ -100,7 +89,7 @@ export function assertSocketPathWithinLimit(socketPath: string): void {
   const socketPathByteLength = Buffer.byteLength(socketPath, "utf8");
   if (socketPathByteLength > maximumChannelSocketPathUtf8Bytes) {
     throw new RangeError(
-      `Channel socket path must not exceed ${maximumChannelSocketPathUtf8Bytes} UTF-8 bytes but was ${socketPathByteLength}; set ${socketDirectoryOverrideEnvironmentVariableName} to a shorter absolute directory to fix this`,
+      `Channel socket path must not exceed ${maximumChannelSocketPathUtf8Bytes} UTF-8 bytes but was ${socketPathByteLength}; set XDG_STATE_HOME to a shorter absolute directory to fix this`,
     );
   }
 }

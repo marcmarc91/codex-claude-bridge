@@ -1,6 +1,9 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { constants } from "node:fs";
+import { open, realpath, type FileHandle } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { resolveStateHomeDirectory } from "../runtime/paths.js";
 
 import { z } from "zod";
 
@@ -129,6 +132,22 @@ async function acquireMessageStatusLock(fileDescriptor: number): Promise<void> {
   }
 }
 
+async function readStatusRecords(fileHandle: FileHandle): Promise<StoredMessageStatus[]> {
+  const bytes = Buffer.alloc(maximumStoreBytes + 1);
+  let bytesRead = 0;
+  while (bytesRead < bytes.length) {
+    const nextRead = await fileHandle.read(bytes, bytesRead, bytes.length - bytesRead, bytesRead);
+    if (nextRead.bytesRead === 0) break;
+    bytesRead += nextRead.bytesRead;
+  }
+  if (bytesRead > maximumStoreBytes) throw new Error("Message status store exceeds its size limit");
+  const records = storedStatusesSchema.parse(JSON.parse(bytes.subarray(0, bytesRead).toString("utf8"))).records;
+  if (new Set(records.map((record) => record.messageId)).size !== records.length) {
+    throw new Error("Message status store contains duplicate identifiers");
+  }
+  return records;
+}
+
 async function readStatuses(context: SecureBridgeStateContext, recordPath: string): Promise<StoredMessageStatus[]> {
   let openedRecord;
   try {
@@ -138,19 +157,7 @@ async function readStatuses(context: SecureBridgeStateContext, recordPath: strin
     throw error;
   }
   try {
-    const bytes = Buffer.alloc(maximumStoreBytes + 1);
-    let bytesRead = 0;
-    while (bytesRead < bytes.length) {
-      const nextRead = await openedRecord.fileHandle.read(bytes, bytesRead, bytes.length - bytesRead, bytesRead);
-      if (nextRead.bytesRead === 0) break;
-      bytesRead += nextRead.bytesRead;
-    }
-    if (bytesRead > maximumStoreBytes) throw new Error("Message status store exceeds its size limit");
-    const records = storedStatusesSchema.parse(JSON.parse(bytes.subarray(0, bytesRead).toString("utf8"))).records;
-    if (new Set(records.map((record) => record.messageId)).size !== records.length) {
-      throw new Error("Message status store contains duplicate identifiers");
-    }
-    return records;
+    return await readStatusRecords(openedRecord.fileHandle);
   } finally {
     await openedRecord.fileHandle.close();
   }
@@ -172,6 +179,55 @@ async function writeStatuses(context: SecureBridgeStateContext, recordPath: stri
     await renamePrivateRegularFile(context, temporaryPath, recordPath);
   } finally {
     await removePrivateRegularFileIfPresent(context, temporaryPath);
+  }
+}
+
+function messageStatusIsOverdue(record: StoredMessageStatus, now: Date): boolean {
+  return (record.messageType === "question" || record.messageType === "handoff") &&
+    record.repliedAt === undefined && record.transportState !== "failed" &&
+    Date.parse(record.deadlineAt) <= now.getTime();
+}
+
+async function verifyReadOnlyMessageDirectory(directoryPath: string, userIdentifier: number): Promise<void> {
+  const handle = await open(directoryPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    const status = await handle.stat();
+    if (!status.isDirectory() || status.uid !== userIdentifier || (status.mode & 0o7777) !== 0o700 ||
+      await realpath(directoryPath) !== resolve(directoryPath)) {
+      throw new Error("Message status directory is not canonical, private, or owned by the current user");
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function listOverdueReadOnly(options: { stateHomeDirectory?: string; now?: Date } = {}): Promise<MessageStatusRecord[]> {
+  const now = options.now ?? new Date();
+  timestampSchema.parse(now.toISOString());
+  if (typeof process.getuid !== "function") throw new Error("A numeric user identifier is required for message inspection");
+  const userIdentifier = process.getuid();
+  try {
+    const stateRoot = await realpath(resolveStateHomeDirectory(options.stateHomeDirectory));
+    const bridgeDirectory = join(stateRoot, "codex-claude-bridge");
+    const messagesDirectory = join(bridgeDirectory, "messages");
+    await verifyReadOnlyMessageDirectory(bridgeDirectory, userIdentifier);
+    await verifyReadOnlyMessageDirectory(messagesDirectory, userIdentifier);
+    const handle = await open(join(messagesDirectory, "statuses.json"), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const status = await handle.stat();
+      if (!status.isFile() || status.uid !== userIdentifier || (status.mode & 0o7777) !== 0o600 || status.nlink !== 1) {
+        throw new Error("Message status record is not a private regular file owned by the current user");
+      }
+      const records = await readStatusRecords(handle);
+      await verifyReadOnlyMessageDirectory(bridgeDirectory, userIdentifier);
+      await verifyReadOnlyMessageDirectory(messagesDirectory, userIdentifier);
+      return records.filter((record) => Date.parse(record.expiresAt) > now.getTime() && messageStatusIsOverdue(record, now)).map(publicStatus);
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
   }
 }
 
@@ -325,11 +381,7 @@ export function createMessageStatusStore(options: CreateMessageStatusStoreOption
     },
     listOverdue(requestedDate) {
       if (requestedDate !== undefined) timestampSchema.parse(requestedDate.toISOString());
-      return withStore((records, now) => records.filter((record) =>
-        (record.messageType === "question" || record.messageType === "handoff") &&
-        record.repliedAt === undefined && record.transportState !== "failed" &&
-        Date.parse(record.deadlineAt) <= now.getTime(),
-      ).map(publicStatus), requestedDate);
+      return withStore((records, now) => records.filter((record) => messageStatusIsOverdue(record, now)).map(publicStatus), requestedDate);
     },
   };
 }

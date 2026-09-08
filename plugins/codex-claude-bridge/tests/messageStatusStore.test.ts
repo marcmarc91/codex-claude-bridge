@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { fork, spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
 import {
   createMessageStatusStore,
   MessageStatusLockTimeoutError,
+  listOverdueReadOnly,
   resolveMessageTimeoutMinutes,
 } from "../src/conversations/messageStatusStore.js";
 import type { AgentAddress, AgentMessageEnvelope } from "../src/protocol/messageEnvelope.js";
@@ -60,6 +61,88 @@ async function createTestState(testContext: test.TestContext) {
     },
   };
 }
+
+test("read-only overdue inspection leaves missing state absent", async (testContext) => {
+  const fixture = await createTestState(testContext);
+  const stateHomeDirectory = join(fixture.storeOptions.stateHomeDirectory, "missing-state");
+  assert.deepEqual(await listOverdueReadOnly({ stateHomeDirectory }), []);
+  await assert.rejects(stat(stateHomeDirectory), { code: "ENOENT" });
+  assert.deepEqual(await listOverdueReadOnly({ stateHomeDirectory: fixture.storeOptions.stateHomeDirectory }), []);
+  assert.deepEqual(await readdir(fixture.storeOptions.stateHomeDirectory), []);
+});
+
+test("read-only overdue inspection filters expiry without pruning or creating a lock", async (testContext) => {
+  const fixture = await createTestState(testContext);
+  await fixture.store.createPending(messageEnvelope(1));
+  await fixture.store.markSeen(messageIdentifier(1), claudeAddress);
+  await fixture.store.createPending(messageEnvelope(2), { timeoutMinutes: 1440 });
+  await fixture.store.createPending(messageEnvelope(3, { messageType: "message" }));
+  const statusesPath = join(fixture.messagesDirectory, "statuses.json");
+  const before = await readFile(statusesPath, "utf8");
+  await unlink(join(fixture.messagesDirectory, ".mutation.lock"));
+  const overdue = await listOverdueReadOnly({
+    stateHomeDirectory: fixture.storeOptions.stateHomeDirectory,
+    now: new Date("2026-09-08T17:06:00.000Z"),
+  });
+  assert.deepEqual(overdue.map((record) => record.messageId), [messageIdentifier(1)]);
+  assert.equal(overdue[0]?.state, "seen");
+  assert.deepEqual(await listOverdueReadOnly({
+    stateHomeDirectory: fixture.storeOptions.stateHomeDirectory,
+    now: new Date("2026-09-11T17:06:00.000Z"),
+  }), []);
+  assert.equal(await readFile(statusesPath, "utf8"), before);
+  assert.deepEqual(await readdir(fixture.messagesDirectory), ["statuses.json"]);
+  await unlink(statusesPath);
+  assert.deepEqual(await listOverdueReadOnly({ stateHomeDirectory: fixture.storeOptions.stateHomeDirectory }), []);
+  assert.deepEqual(await readdir(fixture.messagesDirectory), []);
+});
+
+test("read-only overdue inspection surfaces corrupt records", async (testContext) => {
+  const fixture = await createTestState(testContext);
+  await fixture.store.createPending(messageEnvelope());
+  const statusesPath = join(fixture.messagesDirectory, "statuses.json");
+  await writeFile(statusesPath, "invalid-json");
+  await assert.rejects(listOverdueReadOnly({ stateHomeDirectory: fixture.storeOptions.stateHomeDirectory }), SyntaxError);
+  assert.equal(await readFile(statusesPath, "utf8"), "invalid-json");
+});
+
+test("read-only overdue inspection rejects unsafe paths without repairing permissions", async (testContext) => {
+  const fixture = await createTestState(testContext);
+  await fixture.store.createPending(messageEnvelope());
+  const statusesPath = join(fixture.messagesDirectory, "statuses.json");
+  const options = { stateHomeDirectory: fixture.storeOptions.stateHomeDirectory };
+  for (const [path, unsafeMode, originalMode] of [
+    [fixture.messagesDirectory, 0o755, 0o700],
+    [statusesPath, 0o640, 0o600],
+  ] as const) {
+    await chmod(path, unsafeMode);
+    await assert.rejects(listOverdueReadOnly(options), /private/);
+    assert.equal((await stat(path)).mode & 0o777, unsafeMode);
+    await chmod(path, originalMode);
+  }
+  const preservedRecordPath = join(fixture.messagesDirectory, "preserved.json");
+  await rename(statusesPath, preservedRecordPath);
+  await symlink(preservedRecordPath, statusesPath);
+  await assert.rejects(listOverdueReadOnly(options));
+  await unlink(statusesPath);
+  await rename(preservedRecordPath, statusesPath);
+  const preservedDirectory = `${fixture.messagesDirectory}-preserved`;
+  await rename(fixture.messagesDirectory, preservedDirectory);
+  await symlink(preservedDirectory, fixture.messagesDirectory);
+  await assert.rejects(listOverdueReadOnly(options));
+});
+
+test("read-only overdue inspection rejects duplicate and oversized records", async (testContext) => {
+  const fixture = await createTestState(testContext);
+  await fixture.store.createPending(messageEnvelope());
+  const statusesPath = join(fixture.messagesDirectory, "statuses.json");
+  const stored = JSON.parse(await readFile(statusesPath, "utf8"));
+  stored.records.push(stored.records[0]);
+  await writeFile(statusesPath, JSON.stringify(stored));
+  await assert.rejects(listOverdueReadOnly({ stateHomeDirectory: fixture.storeOptions.stateHomeDirectory }), /duplicate identifiers/);
+  await writeFile(statusesPath, Buffer.alloc(1_048_577, 0x20));
+  await assert.rejects(listOverdueReadOnly({ stateHomeDirectory: fixture.storeOptions.stateHomeDirectory }), /size limit/);
+});
 
 test("persists private metadata across store instances without message content", async (testContext) => {
   const fixture = await createTestState(testContext);

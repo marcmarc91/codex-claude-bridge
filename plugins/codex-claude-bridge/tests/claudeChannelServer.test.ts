@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -14,6 +15,7 @@ import {
   type ClaudeChannelNotification,
 } from "../src/channel/claudeChannelServer.js";
 import { createConversationRouteStore } from "../src/conversations/conversationRoutes.js";
+import { createMessageStatusStore } from "../src/conversations/messageStatusStore.js";
 import type { AgentMessageEnvelope } from "../src/protocol/messageEnvelope.js";
 import {
   registerActiveSession,
@@ -62,6 +64,7 @@ function inboundEnvelope(
       projectId: codexProjectIdentifier,
     },
     ...overrides,
+    ...(Object.keys(overrides).length > 0 && overrides.messageId === undefined ? { messageId: randomUUID() } : {}),
   };
 }
 
@@ -118,7 +121,7 @@ function observeTransportStart(serverTransport: InMemoryTransport): Promise<void
   return transportStarted;
 }
 
-test("declares the Channel capability without permission relay and exposes exactly three tools", async (testContext) => {
+test("declares the Channel capability without permission relay and exposes receipt acknowledgement", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const channelServer = createClaudeChannelServer({
     owningSession: owningSession(),
@@ -145,7 +148,7 @@ test("declares the Channel capability without permission relay and exposes exact
   const tools = (await client.listTools()).tools;
   assert.deepEqual(
     tools.map(({ name }) => name),
-    ["list_codex_sessions", "send_to_codex", "reply_to_codex"],
+    ["list_codex_sessions", "send_to_codex", "reply_to_codex", "acknowledge_message"],
   );
   const uuidInputSchema = {
     type: "string",
@@ -195,6 +198,10 @@ test("declares the Channel capability without permission relay and exposes exact
       conversation_id: {
         ...uuidInputSchema,
         description: "Inbound bridge conversation UUID.",
+      },
+      reply_to_message_id: {
+        ...uuidInputSchema,
+        description: "Message UUID being answered, when available.",
       },
       content: {
         type: "string",
@@ -477,10 +484,33 @@ test("maps accepted envelopes to Channel notifications and persists the reply ro
           sender_runtime: "codex",
           sender_session_id: codexSessionIdentifier,
           message_type: "question",
+          sent_at: "2026-09-03T12:00:00.000Z",
         },
       },
     },
   ]);
+
+  const statusStore = createMessageStatusStore({
+    stateHomeDirectory,
+    currentDate: () => new Date("2026-09-03T13:00:00.000Z"),
+  });
+  assert.equal((await statusStore.get(inboundEnvelope().messageId))?.state, "accepted");
+  const acknowledgement = await client.callTool({
+    name: "acknowledge_message",
+    arguments: { message_id: inboundEnvelope().messageId },
+  });
+  assert.equal(acknowledgement.isError, undefined);
+  assert.equal((await statusStore.get(inboundEnvelope().messageId))?.state, "seen");
+  const invalidReply = await client.callTool({
+    name: "reply_to_codex",
+    arguments: {
+      conversation_id: conversationIdentifier,
+      reply_to_message_id: randomUUID(),
+      content: "must not be sent",
+    },
+  });
+  assert.equal(invalidReply.isError, true);
+  assert.equal(queuedEnvelopes.length, 0);
 
   const replyResult = await client.callTool({
     name: "reply_to_codex",
@@ -491,12 +521,20 @@ test("maps accepted envelopes to Channel notifications and persists the reply ro
   });
   assert.equal(replyResult.isError, undefined, JSON.stringify(replyResult));
   assert.equal(queuedEnvelopes.length, 1);
+  assert.equal((await statusStore.get(inboundEnvelope().messageId))?.state, "replied");
+  const wrongRecipientAcknowledgement = await client.callTool({
+    name: "acknowledge_message",
+    arguments: { message_id: queuedEnvelopes[0]!.messageId },
+  });
+  assert.equal(wrongRecipientAcknowledgement.isError, true);
+  assert.equal((await statusStore.get(queuedEnvelopes[0]!.messageId))?.state, "accepted");
   assert.deepEqual(queuedEnvelopes[0], {
     schemaVersion: 1,
     messageId: "ea7220bc-cd1e-41f0-bf7f-413982f18a9c",
     conversationId: conversationIdentifier,
     sentAt: "2026-09-03T13:00:00.000Z",
     messageType: "reply",
+    replyToMessageId: inboundEnvelope().messageId,
     sender: {
       runtime: "claude",
       sessionId: claudeSessionIdentifier,

@@ -130,9 +130,12 @@ test("passes the exact approved argv with shell disabled and content serialized 
   const envelope = validEnvelope();
   const serializedInboundMessage = [
     "codex-claude-bridge/v1",
+    `message_id=${envelope.messageId}`,
+    `sent_at=${envelope.sentAt}`,
     `conversation_id=${envelope.conversationId}`,
     `sender_session_id=${envelope.sender.sessionId}`,
     `message_type=${envelope.messageType}`,
+    `ack_command=codex-claude-bridge ack --message ${envelope.messageId}`,
     `reply_command=codex-claude-bridge reply --conversation ${envelope.conversationId} --message <text>`,
     `content_json=${JSON.stringify(envelope.content)}`,
   ].join("\n");

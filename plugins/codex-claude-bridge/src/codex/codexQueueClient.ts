@@ -98,9 +98,13 @@ function validateQueueEnvelope(
 function serializeInboundCodexMessage(envelope: AgentMessageEnvelope): string {
   return [
     "codex-claude-bridge/v1",
+    `message_id=${envelope.messageId}`,
+    `sent_at=${envelope.sentAt}`,
     `conversation_id=${envelope.conversationId}`,
     `sender_session_id=${envelope.sender.sessionId}`,
     `message_type=${envelope.messageType}`,
+    `ack_command=codex-claude-bridge ack --message ${envelope.messageId}`,
+    ...(envelope.replyToMessageId === undefined ? [] : [`reply_to_message_id=${envelope.replyToMessageId}`]),
     `reply_command=codex-claude-bridge reply --conversation ${envelope.conversationId} --message <text>`,
     `content_json=${JSON.stringify(envelope.content)}`,
   ].join("\n");

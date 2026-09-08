@@ -41,6 +41,7 @@ const agentMessageEnvelopeSchema = z
     recipient: agentAddressSchema,
     content: contentSchema,
     replyRoute: agentAddressSchema.optional(),
+    replyToMessageId: uuidSchema.optional(),
   })
   .strict();
 
@@ -77,6 +78,7 @@ export const maximumSerializedAgentMessageEnvelopeFrameUtf8Bytes =
       recipient: maximumBoundedAgentAddress,
       content: "\0".repeat(maximumProtocolMessageContentUtf8Bytes),
       replyRoute: maximumBoundedAgentAddress,
+      replyToMessageId: "ffffffff-ffff-4fff-bfff-ffffffffffff",
     })}\n`,
     "utf8",
   );

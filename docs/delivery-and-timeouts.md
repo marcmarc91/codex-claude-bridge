@@ -15,17 +15,21 @@ Every message has a unique message ID. The conversation ID identifies a route an
 
 Transport state is tracked separately as `pending`, `accepted`, `unknown`, or `failed`. A timeout after a write can leave delivery unknown; it must not be treated as proof of non-delivery. A late explicit acknowledgement or reply can provide stronger evidence than the initial transport result.
 
+Transport acceptance can precede visibility to the Codex agent by tens of minutes during a long-running turn. This delay has been observed during bridge development; queue-drain timing is controlled by the runtime, not guaranteed by this bridge. End the current turn after handing off a review or reporting a status when no independent work remains, so the runtime has an opportunity to surface queued messages. This is a coordination practice, not a delivery guarantee. Do not infer non-delivery or automatically resend work just because the agent has not acknowledged it yet.
+
 Acknowledgements are idempotent and scoped to the exact recipient runtime, session, and project. A correlated reply implies acknowledgement. Receipts preserve sent, transport-accepted, acknowledged, and replied timestamps separately. An acknowledgement arriving before the sender records transport acceptance does not invent a transport-acceptance timestamp.
 
 On Claude, call `acknowledge_message` with the inbound `message_id` before starting requested work. Use `reply_to_message_id` with `reply_to_codex` to correlate a reply explicitly. When conversation-only correlation is ambiguous, the reply can still be delivered but no individual original receipt is marked replied. Diagnostic notifications are not new task messages and must not be acknowledged or replied to as tasks.
 
 ## Timeout and process lifetime
 
-`CODEX_CLAUDE_BRIDGE_TIMEOUT_MINUTES` configures the default deadline. The default is five minutes; valid values range from 0.01 to 1440 minutes. A deadline is not an execution deadline and never cancels another agent's work.
+`CODEX_CLAUDE_BRIDGE_TIMEOUT_MINUTES` configures the default deadline. The default is five minutes; valid values range from 0.01 to 1440 minutes. Reaching it triggers diagnosis, not a delivery-failure verdict. A deadline is not an execution deadline and never cancels another agent's work.
 
 Claude-to-Codex questions and handoffs are monitored by the sending Claude Channel process. It checks overdue receipts approximately every 30 seconds and sends a diagnostic Channel notification when no correlated reply has arrived. Plain informational messages are not included in overdue scans. Monitoring stops when that process exits.
 
 Codex-to-Claude monitoring requires an explicitly waiting CLI invocation or a subsequent status check. No process survives a CLI invocation. The wait helper supports waiting for either `seen` or `replied`; waiting only for `seen` cannot detect a later missing reply. Persisted deadlines can be evaluated lazily after restart, but they do not create an always-on reminder service.
+
+An explicit wait retries temporary receipt-lock contention until its deadline. If the receipt remains inaccessible, the result is `unknown` with reason `receipt_lock_timeout`, not `missing`, `seen`, or a proven delivery failure. Other storage errors remain visible. An in-flight lock acquisition may exceed the deadline by up to approximately four seconds.
 
 ## Diagnosis and safe recovery
 

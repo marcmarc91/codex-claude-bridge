@@ -16,6 +16,8 @@ Tests use temporary state directories and local Unix sockets. Run them in an env
 
 Global installation is a separate integration step. It changes user-level plugin registrations and may configure an editor. Unit tests passing does not establish that a running Claude session loaded the Channel or that an agent acknowledged a message. Report live integration checks separately, including runtime versions and which direction was tested.
 
+The GitHub Actions workflow runs dependency installation, type checking, tests, and build on macOS with Node.js 22 for pull requests and pushes to `main`. Runs are limited to 15 minutes, and a newer run on the same ref cancels the previous one. A reviewed workflow file is not evidence that GitHub has executed it successfully; link the actual run when reporting CI results.
+
 ## Changes and review
 
 Keep changes focused, use descriptive identifiers, and preserve existing user configuration. Add tests for changed behavior, especially cancellation, concurrent updates, session replacement, and uncertain delivery outcomes. Use conventional commit messages without generated attribution trailers.

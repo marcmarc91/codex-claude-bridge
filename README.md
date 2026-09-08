@@ -18,7 +18,7 @@ There is no standalone daemon, TCP listener, broadcast, or bridge-owned offline 
 - pnpm 9
 - Codex 0.149.0 or newer
 - Claude Code 2.1.224 or newer
-- Visual Studio Code with the Claude Code extension for automatic wrapper activation
+- Optional: VS Code, VS Code Insiders, Cursor, or Windsurf with the Claude Code extension
 
 Custom Claude Channels are experimental. The required development Channel selector is added only to newly started Claude processes:
 
@@ -35,13 +35,30 @@ Clone the repository and run the installer from its root:
 ```bash
 git clone https://github.com/marcmarc91/codex-claude-bridge.git
 cd codex-claude-bridge
-pnpm install --frozen-lockfile
-pnpm verify
-pnpm --filter codex-claude-bridge bridge install --global
-codex-claude-bridge doctor
+pnpm bootstrap
 ```
 
+Bootstrap installs dependencies, builds the package, and runs setup. Setup checks the installation, runs diagnostics, and prints the next steps. Then start one runtime in each of two terminals, from the same project directory:
+
+```bash
+codex-claude-bridge launch claude
+codex-claude-bridge launch codex
+```
+
+Pass runtime arguments after the runtime name; `--` is supported. Accept the normal Channel and hook-trust prompts. Starting the processes is not yet a verified connection: use the [live round-trip check](#live-round-trip-check) below.
+
 Keep this checkout at the same path while the bridge is installed. The npm global link and both local marketplace registrations refer to this checkout. Run `codex-claude-bridge uninstall --global` before moving or deleting it.
+
+Setup is repeatable and refreshes an existing installation. Editor integration is optional and auto-detected. Configure an explicit settings file or skip editor integration with:
+
+```bash
+codex-claude-bridge setup --vscode-settings /absolute/path/to/settings.json
+codex-claude-bridge setup --no-vscode
+```
+
+Setup has no confirmation prompts of its own. Runtime approvals and permission modes remain unchanged.
+
+Only existing settings files are auto-detected. Create an editor's user settings first if it has never saved any, or use an explicit existing settings file during initial setup. Refresh does not overwrite a wrapper changed by the user and does not take ownership of a previously unowned setting. `--no-vscode` skips editor changes; it does not uninstall existing editor integration or discard its restoration record. Diagnostics can still report retained editor settings that differ from the recorded installation.
 
 Before mutating global state, the installer prints the build, commands, paths, VS Code setting, and receipt it will manage. Installation:
 
@@ -49,7 +66,7 @@ Before mutating global state, the installer prints the build, commands, paths, V
 - creates npm global links for `codex-claude-bridge` and `claude-code-bridge-wrapper`;
 - registers and installs the local Codex marketplace plugin;
 - registers and installs the local Claude marketplace plugin at user scope;
-- sets `claudeCode.claudeProcessWrapper` in the VS Code user settings;
+- optionally sets `claudeCode.claudeProcessWrapper` in the selected editor's user settings;
 - records owned changes in a private installation receipt.
 
 The installer does not write to application repositories. It also verifies that the global `codex-claude-bridge` command resolves from the installer's `PATH`. The VS Code process wrapper prepends that global `bin` directory to Claude's `PATH`; a Claude process started directly in a terminal must already inherit it.
@@ -66,7 +83,13 @@ For the VS Code extension:
 4. Accept the normal Codex hook-trust prompt if one is shown. Do not use `--dangerously-bypass-hook-trust`.
 5. Run `codex-claude-bridge doctor` again.
 
-For Claude Code in a terminal, start a new process with the Channel selected explicitly:
+For Claude Code in a terminal, the launcher selects the Channel:
+
+```bash
+codex-claude-bridge launch claude
+```
+
+The equivalent direct runtime command is:
 
 ```bash
 claude --dangerously-load-development-channels \
@@ -125,6 +148,17 @@ codex-claude-bridge reply \
 
 Add `--json` to `send` or `reply` for structured output. A successful result contains `acknowledgement: "transport acknowledgement only"`: it confirms that the target runtime accepted the message, not that the target model processed it.
 
+Record explicit receipt of an inbound message and inspect its status:
+
+```bash
+codex-claude-bridge ack --message <message-uuid>
+codex-claude-bridge status --message <message-uuid>
+```
+
+Use the message UUID, not the conversation UUID. Add `--wait-minutes 5` to `send` to keep that invocation waiting: questions and handoffs wait for a correlated reply; informational messages wait for an explicit acknowledgement. A seen-but-unreplied question still reaches the reply deadline. Without a waiting invocation, no CLI background monitor remains running.
+
+`CODEX_CLAUDE_BRIDGE_TIMEOUT_MINUTES` sets the default receipt deadline in minutes (default `5`). See [delivery and timeout semantics](docs/delivery-and-timeouts.md) for diagnostics, retention, and recovery limits.
+
 Inspect the installation:
 
 ```bash
@@ -163,16 +197,14 @@ The check passes when:
 
 ## Update
 
-For a deterministic update, uninstall with the currently installed checkout before replacing its contents, update the checkout, and reinstall:
+From the original checkout, update the source and refresh the installation:
 
 ```bash
-codex-claude-bridge uninstall --global
-pnpm install
-pnpm verify
-pnpm --filter codex-claude-bridge bridge install --global
+git pull
+pnpm bootstrap
 ```
 
-Restart both Codex and Claude processes after reinstalling. Re-running `install --global` against an intact installed receipt verifies the installation and returns without replacing already installed integrations.
+Restart both Codex and Claude processes after setup. Existing processes do not reload the new hooks or Channel. Preserve any local changes before updating; do not force-reset the checkout to resolve an update conflict.
 
 ## Uninstall
 
@@ -200,6 +232,8 @@ Do not use this flag preemptively. It can recover an unconfirmed command for whi
 Message receipts distinguish transport acceptance, explicit agent acknowledgement, and a correlated reply. None of these states proves that the requested work succeeded. See [delivery and timeout semantics](docs/delivery-and-timeouts.md) for the state model, monitoring limits, and safe recovery policy.
 
 Bridge state is stored below `${XDG_STATE_HOME:-~/.local/state}/codex-claude-bridge`. Directories use mode `0700`; records, locks, receipts, and sockets use mode `0600`.
+
+Channel socket paths must fit within 103 UTF-8 bytes, including the filename. If the default location is too long, choose a shorter absolute `XDG_STATE_HOME` consistently for setup and both runtimes, then start fresh processes. Changing this variable selects a different state location; it does not migrate an existing installation receipt or active sessions. Do not change it for only one side of the bridge.
 
 The bridge:
 

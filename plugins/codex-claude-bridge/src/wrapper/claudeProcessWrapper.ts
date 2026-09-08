@@ -9,7 +9,7 @@ export const bridgeChannelSelector =
 const channelSelectionFlag = "--dangerously-load-development-channels";
 const forwardedSignals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 
-interface SpawnedClaudeProcess {
+interface SupervisedProcess {
   once(event: "error", listener: (error: Error) => void): this;
   once(
     event: "close",
@@ -23,12 +23,12 @@ interface SpawnedClaudeProcess {
   kill(signal: NodeJS.Signals): boolean;
 }
 
-export interface ClaudeProcessWrapperDependencies {
+export interface ProcessSupervisionDependencies {
   spawnProcess: (
     executablePath: string,
     argumentsList: string[],
     options: { shell: false; stdio: "inherit"; env: NodeJS.ProcessEnv },
-  ) => SpawnedClaudeProcess;
+  ) => SupervisedProcess;
   addSignalHandler: (
     signal: NodeJS.Signals,
     handler: () => void,
@@ -38,6 +38,10 @@ export interface ClaudeProcessWrapperDependencies {
     handler: () => void,
   ) => void;
   signalHandlers: Map<NodeJS.Signals, () => void>;
+}
+
+export interface ClaudeProcessWrapperDependencies
+  extends ProcessSupervisionDependencies {
   wrapperExecutablePath?: string;
   processEnvironment?: NodeJS.ProcessEnv;
   resolveExecutableIdentity?: (executablePath: string) => Promise<string>;
@@ -79,17 +83,16 @@ function signalExitCode(signal: NodeJS.Signals | null): number {
   return 128 + constants.signals[signal];
 }
 
-function buildClaudeProcessEnvironment(
+export function prependGlobalBinaryDirectory(
   processEnvironment: NodeJS.ProcessEnv,
-  wrapperExecutablePath: string | undefined,
+  globalBinaryDirectory: string | undefined,
 ): NodeJS.ProcessEnv {
   if (
-    wrapperExecutablePath === undefined ||
-    !isAbsolute(wrapperExecutablePath)
+    globalBinaryDirectory === undefined ||
+    !isAbsolute(globalBinaryDirectory)
   ) {
     return { ...processEnvironment };
   }
-  const globalBinaryDirectory = dirname(wrapperExecutablePath);
   const remainingPathDirectories = (processEnvironment.PATH ?? "")
     .split(delimiter)
     .filter(
@@ -100,6 +103,18 @@ function buildClaudeProcessEnvironment(
     ...processEnvironment,
     PATH: [globalBinaryDirectory, ...remainingPathDirectories].join(delimiter),
   };
+}
+
+function buildClaudeProcessEnvironment(
+  processEnvironment: NodeJS.ProcessEnv,
+  wrapperExecutablePath: string | undefined,
+): NodeJS.ProcessEnv {
+  return prependGlobalBinaryDirectory(
+    processEnvironment,
+    wrapperExecutablePath === undefined || !isAbsolute(wrapperExecutablePath)
+      ? undefined
+      : dirname(wrapperExecutablePath),
+  );
 }
 
 function createDefaultDependencies(): ClaudeProcessWrapperDependencies {
@@ -135,21 +150,31 @@ export async function runClaudeProcessWrapper(
     throw new Error("Claude process wrapper cannot invoke itself");
   }
 
-  const claudeProcess = dependencies.spawnProcess(
+  return runSupervisedProcess(
     claudeExecutablePath,
     buildClaudeProcessArguments(originalArguments),
-    {
-      shell: false,
-      stdio: "inherit",
-      env: buildClaudeProcessEnvironment(
-        dependencies.processEnvironment ?? process.env,
-        wrapperExecutablePath,
-      ),
-    },
+    buildClaudeProcessEnvironment(
+      dependencies.processEnvironment ?? process.env,
+      wrapperExecutablePath,
+    ),
+    dependencies,
+  );
+}
+
+export async function runSupervisedProcess(
+  executablePath: string,
+  argumentsList: string[],
+  processEnvironment: NodeJS.ProcessEnv,
+  dependencies: ProcessSupervisionDependencies,
+): Promise<number> {
+  const supervisedProcess = dependencies.spawnProcess(
+    executablePath,
+    argumentsList,
+    { shell: false, stdio: "inherit", env: processEnvironment },
   );
   for (const signal of forwardedSignals) {
     const handler = (): void => {
-      claudeProcess.kill(signal);
+      supervisedProcess.kill(signal);
     };
     dependencies.signalHandlers.set(signal, handler);
     dependencies.addSignalHandler(signal, handler);
@@ -159,8 +184,8 @@ export async function runClaudeProcessWrapper(
     return await new Promise<number>((resolveProcess, rejectProcess) => {
       let settled = false;
       const removeChildListeners = (): void => {
-        claudeProcess.off("error", handleError);
-        claudeProcess.off("close", handleClose);
+        supervisedProcess.off("error", handleError);
+        supervisedProcess.off("close", handleClose);
       };
       const handleError = (error: Error): void => {
         if (settled) {
@@ -181,8 +206,8 @@ export async function runClaudeProcessWrapper(
         removeChildListeners();
         resolveProcess(exitCode ?? signalExitCode(signal));
       };
-      claudeProcess.once("error", handleError);
-      claudeProcess.once("close", handleClose);
+      supervisedProcess.once("error", handleError);
+      supervisedProcess.once("close", handleClose);
     });
   } finally {
     for (const [signal, handler] of dependencies.signalHandlers) {

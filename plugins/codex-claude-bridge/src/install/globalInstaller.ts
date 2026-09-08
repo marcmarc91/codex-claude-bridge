@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { ActiveSessionRecord } from "../registry/activeSessionRegistry.js";
@@ -25,6 +25,7 @@ import {
   compareAndSwapJsonStringSetting,
   readJsonSetting,
   updateJsonStringSetting,
+  type JsonSettingSnapshot,
 } from "./jsonSettingsEditor.js";
 import {
   readReceipt,
@@ -34,6 +35,7 @@ import {
   writeReceipt,
   type InstallationReceipt,
   type InstallationStep,
+  type VscodeSettingsTarget,
 } from "./installationReceiptStore.js";
 import {
   assertMarketplaceSources,
@@ -48,6 +50,7 @@ import {
   type InstalledIntegrationState,
 } from "./integrationStateDiscovery.js";
 import { inspectActiveSessionsReadOnly } from "./readOnlySessionInspector.js";
+import { discoverVscodeUserSettingsPaths } from "./vscodeSettingsDiscovery.js";
 
 export {
   executeBoundedCommand,
@@ -66,12 +69,14 @@ export interface GlobalInstallerOptions {
   stateHomeDirectory?: string;
   environmentPath?: string;
   vscodeSettingsPath?: string;
+  configureVscode?: boolean;
   executables?: InstallerExecutables;
   executeCommand?: (
     request: CommandExecutionRequest,
   ) => Promise<CommandExecutionResult>;
   writeOutput?: (value: string) => void;
   listActiveSessions?: () => Promise<ActiveSessionRecord[]>;
+  listRunningClaudeProcessIdentifiers?: () => Promise<number[]>;
   processGroupIsActive?: (processGroupIdentifier: number) => Promise<boolean>;
   confirmPendingCommandStopped?: boolean;
   installationLockTimeoutSeconds?: number;
@@ -95,7 +100,8 @@ interface ResolvedInstallerContext {
   homeDirectory: string;
   stateHomeDirectory: string | undefined;
   environmentPath: string;
-  vscodeSettingsPath: string;
+  vscodeSettingsPaths: string[];
+  explicitVscodeSettingsPath: string | undefined;
   executables: InstallerExecutables;
   executeCommand: (
     request: CommandExecutionRequest,
@@ -114,6 +120,7 @@ const pluginIdentifier = `${pluginName}@${marketplaceName}`;
 const wrapperSettingName = "claudeCode.claudeProcessWrapper";
 const commandTimeoutMilliseconds = 15_000;
 const maximumCommandOutputBytes = 65_536;
+const maximumProcessListingBytes = 4 * 1024 * 1024;
 const defaultInstallationLockTimeoutSeconds = 4;
 const modulePluginRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const canonicalInstallationOrder: InstallationStep[] = [
@@ -124,6 +131,14 @@ const canonicalInstallationOrder: InstallationStep[] = [
   "claudePlugin",
   "vscodeSetting",
 ];
+
+function installReceiptPath(stateHomeDirectory: string | undefined): string {
+  return join(
+    resolveStateHomeDirectory(stateHomeDirectory),
+    "codex-claude-bridge",
+    "install-receipt.json",
+  );
+}
 
 async function processGroupIsActive(
   processGroupIdentifier: number,
@@ -197,15 +212,20 @@ async function resolveInstallerContext(
         })(),
       claude: await resolveClaudeExecutable({ homeDirectory, environmentPath }),
     };
+  const vscodeSettingsPaths =
+    options.vscodeSettingsPath !== undefined
+      ? [options.vscodeSettingsPath]
+      : options.configureVscode === false
+        ? []
+        : await discoverVscodeUserSettingsPaths(homeDirectory, process.platform);
   return {
     repositoryRoot,
     pluginRoot,
     homeDirectory,
     stateHomeDirectory: options.stateHomeDirectory,
     environmentPath,
-    vscodeSettingsPath:
-      options.vscodeSettingsPath ??
-      join(homeDirectory, "Library", "Application Support", "Code", "User", "settings.json"),
+    vscodeSettingsPaths,
+    explicitVscodeSettingsPath: options.vscodeSettingsPath,
     executables,
     executeCommand: options.executeCommand ?? executeBoundedCommand,
     writeOutput: options.writeOutput ?? ((value) => process.stdout.write(value)),
@@ -236,10 +256,91 @@ function printStatePreparationPlan(context: ResolvedInstallerContext): void {
   );
 }
 
-function createReceipt(
+async function readVscodeSetting(
+  settingsPath: string,
+): Promise<JsonSettingSnapshot> {
+  try {
+    return await readJsonSetting(settingsPath, wrapperSettingName);
+  } catch (error) {
+    throw new Error(
+      `VS Code settings at ${settingsPath} are unreadable: ${error instanceof Error ? error.message : "unknown error"}`,
+    );
+  }
+}
+
+function vscodeSettingsTarget(
+  settingsPath: string,
+  previous: JsonSettingSnapshot,
+  wrapperPath: string,
+): VscodeSettingsTarget {
+  return {
+    settingsPath,
+    previous,
+    installedValue: wrapperPath,
+    owned: !previous.present || previous.value !== wrapperPath,
+  };
+}
+
+async function createVscodeSettingsTargets(
+  context: ResolvedInstallerContext,
+  settingsPaths: string[],
+  wrapperPath: string,
+): Promise<VscodeSettingsTarget[]> {
+  const targets: VscodeSettingsTarget[] = [];
+  for (const settingsPath of settingsPaths) {
+    const settingsFileExists = await pathExists(settingsPath);
+    if (!settingsFileExists && context.explicitVscodeSettingsPath !== undefined) {
+      throw new Error(`VS Code settings file does not exist: ${settingsPath}`);
+    }
+    if (!settingsFileExists) {
+      continue;
+    }
+    try {
+      targets.push(
+        vscodeSettingsTarget(
+          settingsPath,
+          await readVscodeSetting(settingsPath),
+          wrapperPath,
+        ),
+      );
+    } catch (error) {
+      if (context.explicitVscodeSettingsPath !== undefined) {
+        throw error;
+      }
+      context.writeOutput(
+        `${error instanceof Error ? error.message : "VS Code settings are unreadable"}; skipping this editor.\n`,
+      );
+    }
+  }
+  return targets;
+}
+
+async function resnapshotVscodeSettingsTargets(
+  targets: VscodeSettingsTarget[],
+  wrapperPath: string,
+): Promise<VscodeSettingsTarget[]> {
+  const resnapshotTargets: VscodeSettingsTarget[] = [];
+  for (const target of targets) {
+    const currentSetting = await readVscodeSetting(target.settingsPath);
+    resnapshotTargets.push(
+      currentSetting.present && currentSetting.value === wrapperPath
+        ? target
+        : vscodeSettingsTarget(target.settingsPath, currentSetting, wrapperPath),
+    );
+  }
+  return resnapshotTargets;
+}
+
+function ownedVscodeSettingsTargets(
+  receipt: InstallationReceipt,
+): VscodeSettingsTarget[] {
+  return receipt.vscodeTargets.filter((target) => target.owned);
+}
+
+async function createReceipt(
   context: ResolvedInstallerContext,
   installedState: InstalledIntegrationState,
-): InstallationReceipt {
+): Promise<InstallationReceipt> {
   const wrapperPath = join(
     installedState.npmPrefix,
     "bin",
@@ -269,14 +370,11 @@ function createReceipt(
       ],
       owned: !installedState.npmPackageMatches,
     },
-    vscode: {
-      settingsPath: context.vscodeSettingsPath,
-      previous: installedState.vscodeSetting,
-      installedValue: wrapperPath,
-      owned:
-        !installedState.vscodeSetting.present ||
-        installedState.vscodeSetting.value !== wrapperPath,
-    },
+    vscodeTargets: await createVscodeSettingsTargets(
+      context,
+      context.vscodeSettingsPaths,
+      wrapperPath,
+    ),
     codex: {
       marketplaceOwned: installedState.codexMarketplaceSource === undefined,
       pluginOwned: !installedState.codexPluginInstalled,
@@ -290,39 +388,59 @@ function createReceipt(
   };
 }
 
-function printMutationPlan(
-  context: ResolvedInstallerContext,
-  receipt: InstallationReceipt,
-): void {
-  const buildArguments = [
+function bridgeBuildArguments(receipt: InstallationReceipt): string[] {
+  return [
     join(receipt.pluginRoot, "node_modules", "typescript", "bin", "tsc"),
     "-p",
     join(receipt.pluginRoot, "tsconfig.json"),
   ];
-  const lines = [
-    `build: ${context.executables.node} ${buildArguments.join(" ")}`,
-  ];
-  if (receipt.npm.owned) {
-    lines.push(`npm link: ${context.executables.npm} link --ignore-scripts (cwd ${receipt.pluginRoot})`);
-  }
-  if (receipt.codex.marketplaceOwned) {
-    lines.push(`Codex marketplace: ${context.executables.codex} plugin marketplace add ${receipt.repositoryRoot} --json`);
-  }
-  if (receipt.codex.pluginOwned) {
-    lines.push(`Codex plugin: ${context.executables.codex} plugin add ${pluginIdentifier} --json`);
-  }
-  if (receipt.claude.marketplaceOwned) {
-    lines.push(`Claude marketplace: ${context.executables.claude} plugin marketplace add ${receipt.repositoryRoot} --scope user`);
-  }
-  if (receipt.claude.pluginOwned) {
-    lines.push(`Claude plugin: ${context.executables.claude} plugin install ${pluginIdentifier} --scope user --yes`);
-  }
-  if (receipt.vscode.owned) {
-    lines.push(`VS Code setting: ${receipt.vscode.settingsPath} -> ${receipt.wrapperPath}`);
-  }
-  lines.push(
-    `receipt: ${join(resolveStateHomeDirectory(context.stateHomeDirectory), "codex-claude-bridge", "install-receipt.json")}`,
+}
+
+async function buildBridgePackage(
+  context: ResolvedInstallerContext,
+  receipt: InstallationReceipt,
+): Promise<void> {
+  await runRequiredCommand(
+    context,
+    context.executables.node,
+    bridgeBuildArguments(receipt),
+    receipt.pluginRoot,
   );
+}
+
+function installationStepPlanLine(
+  context: ResolvedInstallerContext,
+  receipt: InstallationReceipt,
+  step: InstallationStep,
+): string {
+  switch (step) {
+    case "npmLink":
+      return `npm link: ${context.executables.npm} link --ignore-scripts (cwd ${receipt.pluginRoot})`;
+    case "codexMarketplace":
+      return `Codex marketplace: ${context.executables.codex} plugin marketplace add ${receipt.repositoryRoot} --json`;
+    case "codexPlugin":
+      return `Codex plugin: ${context.executables.codex} plugin add ${pluginIdentifier} --json`;
+    case "claudeMarketplace":
+      return `Claude marketplace: ${context.executables.claude} plugin marketplace add ${receipt.repositoryRoot} --scope user`;
+    case "claudePlugin":
+      return `Claude plugin: ${context.executables.claude} plugin install ${pluginIdentifier} --scope user --yes`;
+    case "vscodeSetting":
+      return `VS Code setting: ${ownedVscodeSettingsTargets(receipt)
+        .map((target) => target.settingsPath)
+        .join(", ")} -> ${receipt.wrapperPath}`;
+  }
+}
+
+function printMutationPlan(
+  context: ResolvedInstallerContext,
+  receipt: InstallationReceipt,
+  steps: InstallationStep[],
+): void {
+  const lines = [
+    `build: ${context.executables.node} ${bridgeBuildArguments(receipt).join(" ")}`,
+    ...steps.map((step) => installationStepPlanLine(context, receipt, step)),
+    `receipt: ${installReceiptPath(context.stateHomeDirectory)}`,
+  ];
   context.writeOutput(`${lines.join("\n")}\n`);
 }
 
@@ -384,7 +502,9 @@ function printRemovalPlan(
   const lines = rollbackSteps(receipt).map((step) => {
     switch (step) {
       case "vscodeSetting":
-        return `VS Code CAS restore: ${receipt.vscode.settingsPath}`;
+        return `VS Code CAS restore: ${receipt.vscodeTargets
+          .map((target) => target.settingsPath)
+          .join(", ")}`;
       case "claudePlugin":
         return `Claude plugin: ${context.executables.claude} plugin uninstall ${pluginIdentifier} --scope user --yes`;
       case "claudeMarketplace":
@@ -398,7 +518,7 @@ function printRemovalPlan(
     }
   });
   lines.push(
-    `receipt updates: ${join(resolveStateHomeDirectory(context.stateHomeDirectory), "codex-claude-bridge", "install-receipt.json")}`,
+    `receipt updates: ${installReceiptPath(context.stateHomeDirectory)}`,
   );
   context.writeOutput(`${lines.join("\n")}\n`);
 }
@@ -505,6 +625,33 @@ async function clearExternalRemovalStep(
   delete receipt.pendingRemovalStep;
 }
 
+async function restoreVscodeSettingsTarget(
+  context: ResolvedInstallerContext,
+  target: VscodeSettingsTarget,
+): Promise<void> {
+  const result = await compareAndSwapJsonStringSetting({
+    settingsPath: target.settingsPath,
+    settingName: wrapperSettingName,
+    expectedValue: target.installedValue,
+    replacement: target.previous.present
+      ? { present: true, value: target.previous.value }
+      : { present: false },
+  });
+  if (result === "conflict") {
+    context.writeOutput(
+      `VS Code wrapper has user-owned changes at ${target.settingsPath}; leaving it unchanged.\n`,
+    );
+    return;
+  }
+  const currentSetting = await readVscodeSetting(target.settingsPath);
+  if (
+    currentSetting.present !== target.previous.present ||
+    currentSetting.value !== target.previous.value
+  ) {
+    throw new Error("VS Code setting rollback postcondition failed");
+  }
+}
+
 async function rollbackInstallation(
   context: ResolvedInstallerContext,
   stateContext: SecureBridgeStateContext,
@@ -525,27 +672,20 @@ async function rollbackInstallation(
     try {
       switch (step) {
         case "vscodeSetting": {
-          const result = await compareAndSwapJsonStringSetting({
-            settingsPath: receipt.vscode.settingsPath,
-            settingName: wrapperSettingName,
-            expectedValue: receipt.vscode.installedValue,
-            replacement: receipt.vscode.previous.present
-              ? { present: true, value: receipt.vscode.previous.value }
-              : { present: false },
-          });
-          if (result === "conflict") {
-            context.writeOutput("VS Code wrapper has user-owned changes; leaving it unchanged.\n");
-          } else {
-            const currentSetting = await readJsonSetting(
-              receipt.vscode.settingsPath,
-              wrapperSettingName,
-            );
-            if (
-              currentSetting.present !== receipt.vscode.previous.present ||
-              currentSetting.value !== receipt.vscode.previous.value
-            ) {
-              throw new Error("VS Code setting rollback postcondition failed");
+          const restorationErrors: Error[] = [];
+          for (const target of receipt.vscodeTargets) {
+            try {
+              await restoreVscodeSettingsTarget(context, target);
+            } catch (restorationError) {
+              restorationErrors.push(
+                restorationError instanceof Error
+                  ? restorationError
+                  : new Error("VS Code setting rollback failed"),
+              );
             }
+          }
+          if (restorationErrors.length > 0) {
+            throw restorationErrors[0];
           }
           break;
         }
@@ -773,11 +913,15 @@ async function assertReceiptStillInstalled(
     resolve(installedState.codexMarketplaceSource ?? "") !== receipt.repositoryRoot ||
     !installedState.codexPluginInstalled ||
     resolve(installedState.claudeMarketplaceSource ?? "") !== receipt.repositoryRoot ||
-    !installedState.claudePluginInstalled ||
-    !installedState.vscodeSetting.present ||
-    installedState.vscodeSetting.value !== receipt.wrapperPath
+    !installedState.claudePluginInstalled
   ) {
     throw new Error("Installed bridge state drifted from its receipt");
+  }
+  for (const target of receipt.vscodeTargets) {
+    const setting = await readVscodeSetting(target.settingsPath);
+    if (!setting.present || setting.value !== receipt.wrapperPath) {
+      throw new Error("Installed bridge state drifted from its receipt");
+    }
   }
   await assertGlobalBridgeCommandIsResolvable(context, receipt.npm.binPaths[0]);
 }
@@ -798,6 +942,28 @@ async function assertGlobalBridgeCommandIsResolvable(
   }
 }
 
+function assertVscodeTargetProvenance(
+  context: ResolvedInstallerContext,
+  receipt: InstallationReceipt,
+): void {
+  const settingsPaths = receipt.vscodeTargets.map(
+    (target) => target.settingsPath,
+  );
+  if (
+    receipt.vscodeTargets.some(
+      (target) =>
+        !isAbsolute(target.settingsPath) ||
+        target.installedValue !== receipt.wrapperPath,
+    ) ||
+    new Set(settingsPaths).size !== settingsPaths.length ||
+    (context.explicitVscodeSettingsPath !== undefined &&
+      (settingsPaths.length !== 1 ||
+        settingsPaths[0] !== context.explicitVscodeSettingsPath))
+  ) {
+    throw new Error("Install receipt provenance does not match this installation");
+  }
+}
+
 async function validateReceiptProvenance(
   context: ResolvedInstallerContext,
   receipt: InstallationReceipt,
@@ -808,7 +974,6 @@ async function validateReceiptProvenance(
     receipt.repositoryRoot !== context.repositoryRoot ||
     receipt.pluginRoot !== context.pluginRoot ||
     receipt.pluginRoot !== join(receipt.repositoryRoot, "plugins", pluginName) ||
-    receipt.vscode.settingsPath !== context.vscodeSettingsPath ||
     receipt.npm.executablePath !== context.executables.npm ||
     !isAbsolute(receipt.npm.prefix) ||
     receipt.npm.packageLinkPath !==
@@ -817,18 +982,18 @@ async function validateReceiptProvenance(
       join(receipt.npm.prefix, "bin", "codex-claude-bridge") ||
     receipt.npm.binPaths[1] !==
       join(receipt.npm.prefix, "bin", "claude-code-bridge-wrapper") ||
-    receipt.wrapperPath !== receipt.npm.binPaths[1] ||
-    receipt.vscode.installedValue !== receipt.wrapperPath
+    receipt.wrapperPath !== receipt.npm.binPaths[1]
   ) {
     throw new Error("Install receipt provenance does not match this installation");
   }
+  assertVscodeTargetProvenance(context, receipt);
   const stepOwnership: Record<InstallationStep, boolean> = {
     npmLink: receipt.npm.owned,
     codexMarketplace: receipt.codex.marketplaceOwned,
     codexPlugin: receipt.codex.pluginOwned,
     claudeMarketplace: receipt.claude.marketplaceOwned,
     claudePlugin: receipt.claude.pluginOwned,
-    vscodeSetting: receipt.vscode.owned,
+    vscodeSetting: receipt.vscodeTargets.some((target) => target.owned),
   };
   if (
     new Set(receipt.completedSteps).size !== receipt.completedSteps.length ||
@@ -954,8 +1119,384 @@ async function assertSupportedInstallerVersions(
   }
 }
 
-export async function installBridgeGlobally(
-  options: GlobalInstallerOptions = {},
+async function writeVscodeSettingsTarget(
+  target: VscodeSettingsTarget,
+  wrapperPath: string,
+): Promise<void> {
+  const currentSetting = await readVscodeSetting(target.settingsPath);
+  if (currentSetting.present && currentSetting.value === wrapperPath) {
+    return;
+  }
+  const recordedValue = target.previous.value;
+  if (target.previous.present && recordedValue !== undefined) {
+    const result = await compareAndSwapJsonStringSetting({
+      settingsPath: target.settingsPath,
+      settingName: wrapperSettingName,
+      expectedValue: recordedValue,
+      replacement: { present: true, value: wrapperPath },
+    });
+    if (result === "conflict") {
+      throw new Error(
+        `VS Code setting at ${target.settingsPath} changed since it was recorded`,
+      );
+    }
+    return;
+  }
+  if (currentSetting.present) {
+    throw new Error(
+      `VS Code setting at ${target.settingsPath} changed since it was recorded`,
+    );
+  }
+  await updateJsonStringSetting({
+    settingsPath: target.settingsPath,
+    settingName: wrapperSettingName,
+    value: wrapperPath,
+  });
+}
+
+interface InstallationStepOperations {
+  apply: () => Promise<void>;
+  verify: () => Promise<boolean>;
+}
+
+function receiptStepOwnership(
+  receipt: InstallationReceipt,
+): Record<InstallationStep, boolean> {
+  return {
+    npmLink: receipt.npm.owned,
+    codexMarketplace: receipt.codex.marketplaceOwned,
+    codexPlugin: receipt.codex.pluginOwned,
+    claudeMarketplace: receipt.claude.marketplaceOwned,
+    claudePlugin: receipt.claude.pluginOwned,
+    vscodeSetting: receipt.vscodeTargets.some((target) => target.owned),
+  };
+}
+
+function installationStepOperations(
+  context: ResolvedInstallerContext,
+  receipt: InstallationReceipt,
+): Record<InstallationStep, InstallationStepOperations> {
+  return {
+    npmLink: {
+      apply: async () => {
+        await runRequiredCommand(
+          context,
+          context.executables.npm,
+          ["link", "--ignore-scripts"],
+          receipt.pluginRoot,
+        );
+      },
+      verify: async () =>
+        (await pathResolvesTo(receipt.npm.packageLinkPath, receipt.pluginRoot)) &&
+        (await pathResolvesTo(
+          receipt.npm.binPaths[0],
+          join(receipt.pluginRoot, "dist", "bin", "codexClaudeBridge.js"),
+        )) &&
+        (await pathResolvesTo(
+          receipt.npm.binPaths[1],
+          join(receipt.pluginRoot, "dist", "bin", "claudeCodeBridgeWrapper.js"),
+        )),
+    },
+    codexMarketplace: {
+      apply: async () => {
+        await runRequiredCommand(context, context.executables.codex, [
+          "plugin",
+          "marketplace",
+          "add",
+          receipt.repositoryRoot,
+          "--json",
+        ]);
+      },
+      verify: async () =>
+        resolve((await readCodexMarketplaceSource(context)) ?? "") ===
+        receipt.repositoryRoot,
+    },
+    codexPlugin: {
+      apply: async () => {
+        await runRequiredCommand(context, context.executables.codex, [
+          "plugin",
+          "add",
+          pluginIdentifier,
+          "--json",
+        ]);
+      },
+      verify: async () => readCodexPluginInstalled(context),
+    },
+    claudeMarketplace: {
+      apply: async () => {
+        await runRequiredCommand(context, context.executables.claude, [
+          "plugin",
+          "marketplace",
+          "add",
+          receipt.repositoryRoot,
+          "--scope",
+          "user",
+        ]);
+      },
+      verify: async () =>
+        resolve((await readClaudeMarketplaceSource(context)) ?? "") ===
+        receipt.repositoryRoot,
+    },
+    claudePlugin: {
+      apply: async () => {
+        await runRequiredCommand(context, context.executables.claude, [
+          "plugin",
+          "install",
+          pluginIdentifier,
+          "--scope",
+          "user",
+          "--yes",
+        ]);
+      },
+      verify: async () => readClaudePluginInstalled(context),
+    },
+    vscodeSetting: {
+      apply: async () => {
+        for (const target of ownedVscodeSettingsTargets(receipt)) {
+          await writeVscodeSettingsTarget(target, receipt.wrapperPath);
+        }
+      },
+      verify: async () => {
+        for (const target of ownedVscodeSettingsTargets(receipt)) {
+          const setting = await readVscodeSetting(target.settingsPath);
+          if (!setting.present || setting.value !== receipt.wrapperPath) {
+            return false;
+          }
+        }
+        return true;
+      },
+    },
+  };
+}
+
+async function applyInstallationSteps(
+  context: ResolvedInstallerContext,
+  stateContext: SecureBridgeStateContext,
+  receipt: InstallationReceipt,
+  steps: InstallationStep[],
+): Promise<void> {
+  const operations = installationStepOperations(context, receipt);
+  const ownership = receiptStepOwnership(receipt);
+  for (const step of canonicalInstallationOrder.filter((candidate) =>
+    steps.includes(candidate),
+  )) {
+    await performOwnedStep(
+      stateContext,
+      receipt,
+      step,
+      ownership[step],
+      operations[step].apply,
+      operations[step].verify,
+    );
+    if (step === "npmLink") {
+      await assertGlobalBridgeCommandIsResolvable(
+        context,
+        receipt.npm.binPaths[0],
+      );
+    }
+  }
+}
+
+async function recordInstallationStepFailure(
+  context: ResolvedInstallerContext,
+  stateContext: SecureBridgeStateContext,
+  receipt: InstallationReceipt,
+  error: unknown,
+  unconfirmedTerminationPhase: "rollback_failed" | "refreshing",
+): Promise<void> {
+  if (error instanceof CommandTerminationUnconfirmedError) {
+    receipt.phase = unconfirmedTerminationPhase;
+    delete receipt.pendingCommandTerminationConfirmed;
+    receipt.commandTerminationUnconfirmed = true;
+    if (error.processGroupIdentifier !== undefined) {
+      receipt.unconfirmedProcessGroupIdentifier = error.processGroupIdentifier;
+    }
+    context.writeOutput(
+      "receipt recovery: preserve the pending step until command termination is confirmed\n",
+    );
+    await writeReceipt(stateContext, receipt);
+    return;
+  }
+  if (
+    receipt.pendingStep !== undefined &&
+    receipt.pendingStep !== "vscodeSetting"
+  ) {
+    receipt.pendingCommandTerminationConfirmed = true;
+    context.writeOutput(
+      `receipt recovery: record confirmed termination for pending ${receipt.pendingStep}\n`,
+    );
+    await writeReceipt(stateContext, receipt);
+  }
+}
+
+async function performFreshInstallation(
+  context: ResolvedInstallerContext,
+  stateContext: SecureBridgeStateContext,
+): Promise<void> {
+  const installedState = await readInstalledIntegrationState(context);
+  await assertNoNpmCollision(context, installedState);
+  assertMarketplaceSources(context, installedState);
+  await assertSupportedInstallerVersions(context);
+  const receipt = await createReceipt(context, installedState);
+  const ownership = receiptStepOwnership(receipt);
+  printMutationPlan(
+    context,
+    receipt,
+    canonicalInstallationOrder.filter((step) => ownership[step]),
+  );
+  await buildBridgePackage(context, receipt);
+  await writeReceipt(stateContext, receipt);
+  try {
+    await applyInstallationSteps(
+      context,
+      stateContext,
+      receipt,
+      canonicalInstallationOrder,
+    );
+    receipt.phase = "installed";
+    await writeReceipt(stateContext, receipt);
+  } catch (error) {
+    await recordInstallationStepFailure(
+      context,
+      stateContext,
+      receipt,
+      error,
+      "rollback_failed",
+    );
+    if (error instanceof CommandTerminationUnconfirmedError) {
+      throw error;
+    }
+    printRemovalPlan(context, receipt);
+    const rollbackErrors = await rollbackInstallation(
+      context,
+      stateContext,
+      receipt,
+    );
+    if (rollbackErrors.length > 0) {
+      receipt.phase = "rollback_failed";
+      await writeReceipt(stateContext, receipt);
+      throw new AggregateError(
+        [error, ...rollbackErrors],
+        `${error instanceof Error ? error.message : "Installation failed"}; rollback failed`,
+      );
+    }
+    await removeReceipt(stateContext);
+    throw error;
+  }
+}
+
+async function discoverUnrecordedVscodeTargets(
+  context: ResolvedInstallerContext,
+  receipt: InstallationReceipt,
+): Promise<VscodeSettingsTarget[]> {
+  const recordedSettingsPaths = new Set(
+    receipt.vscodeTargets.map((target) => target.settingsPath),
+  );
+  return createVscodeSettingsTargets(
+    context,
+    context.vscodeSettingsPaths.filter(
+      (settingsPath) => !recordedSettingsPaths.has(settingsPath),
+    ),
+    receipt.wrapperPath,
+  );
+}
+
+async function collectDriftedSteps(
+  context: ResolvedInstallerContext,
+  receipt: InstallationReceipt,
+  installedState: InstalledIntegrationState,
+): Promise<InstallationStep[]> {
+  const ownership = receiptStepOwnership(receipt);
+  const operations = installationStepOperations(context, receipt);
+  const stepIsInstalled: Record<InstallationStep, boolean> = {
+    npmLink: installedState.npmPackageMatches && installedState.npmBinPathsMatch,
+    codexMarketplace:
+      resolve(installedState.codexMarketplaceSource ?? "") ===
+      receipt.repositoryRoot,
+    codexPlugin: installedState.codexPluginInstalled,
+    claudeMarketplace:
+      resolve(installedState.claudeMarketplaceSource ?? "") ===
+      receipt.repositoryRoot,
+    claudePlugin: installedState.claudePluginInstalled,
+    vscodeSetting: await operations.vscodeSetting.verify(),
+  };
+  return canonicalInstallationOrder.filter(
+    (step) => ownership[step] && !stepIsInstalled[step],
+  );
+}
+
+async function markReceiptInstalled(
+  stateContext: SecureBridgeStateContext,
+  receipt: InstallationReceipt,
+): Promise<void> {
+  if (
+    receipt.phase === "installed" &&
+    receipt.pendingStep === undefined &&
+    receipt.pendingCommandTerminationConfirmed === undefined
+  ) {
+    return;
+  }
+  receipt.phase = "installed";
+  delete receipt.pendingStep;
+  delete receipt.pendingCommandTerminationConfirmed;
+  await writeReceipt(stateContext, receipt);
+}
+
+async function refreshInstalledBridge(
+  context: ResolvedInstallerContext,
+  stateContext: SecureBridgeStateContext,
+  receipt: InstallationReceipt,
+): Promise<void> {
+  const installedState = await readInstalledIntegrationState(context);
+  const refreshedTargets = [
+    ...(await resnapshotVscodeSettingsTargets(
+      receipt.vscodeTargets,
+      receipt.wrapperPath,
+    )),
+    ...(await discoverUnrecordedVscodeTargets(context, receipt)),
+  ];
+  const refreshedReceipt: InstallationReceipt = {
+    ...receipt,
+    vscodeTargets: refreshedTargets,
+  };
+  const driftedSteps = await collectDriftedSteps(
+    context,
+    refreshedReceipt,
+    installedState,
+  );
+  const recordedTargetsChanged =
+    JSON.stringify(refreshedTargets) !== JSON.stringify(receipt.vscodeTargets);
+  if (!recordedTargetsChanged && driftedSteps.length === 0) {
+    await markReceiptInstalled(stateContext, receipt);
+    context.writeOutput("Bridge integrations are already installed.\n");
+    return;
+  }
+  await assertNoNpmCollision(context, installedState);
+  assertMarketplaceSources(context, installedState);
+  await assertSupportedInstallerVersions(context);
+  printMutationPlan(context, refreshedReceipt, driftedSteps);
+  await buildBridgePackage(context, receipt);
+  receipt.vscodeTargets = refreshedTargets;
+  receipt.phase = "refreshing";
+  await writeReceipt(stateContext, receipt);
+  try {
+    await applyInstallationSteps(context, stateContext, receipt, driftedSteps);
+    await markReceiptInstalled(stateContext, receipt);
+  } catch (error) {
+    await recordInstallationStepFailure(
+      context,
+      stateContext,
+      receipt,
+      error,
+      "refreshing",
+    );
+    throw error;
+  }
+}
+
+async function applyBridgeInstallation(
+  options: GlobalInstallerOptions,
+  repairInstalledBridge: boolean,
 ): Promise<void> {
   const context = await resolveInstallerContext(options);
   printStatePreparationPlan(context);
@@ -965,211 +1506,56 @@ export async function installBridgeGlobally(
       timeoutSeconds: context.installationLockTimeoutSeconds,
     },
     async (stateContext) => {
-    const existingReceipt = await readReceipt(stateContext);
-    if (existingReceipt?.phase === "installed") {
-      await validateReceiptProvenance(context, existingReceipt);
-      await assertReceiptStillInstalled(context, existingReceipt);
-      context.writeOutput("Bridge integrations are already installed.\n");
-      return;
-    }
-    if (existingReceipt !== undefined) {
-      await validateReceiptProvenance(context, existingReceipt);
-      await prepareReceiptForRecovery(context, stateContext, existingReceipt);
-      printRemovalPlan(context, existingReceipt);
-      const recoveryErrors = await rollbackInstallation(
-        context,
-        stateContext,
-        existingReceipt,
-      );
-      if (recoveryErrors.length > 0) {
-        existingReceipt.phase = "rollback_failed";
-        await writeReceipt(stateContext, existingReceipt);
-        throw new AggregateError(recoveryErrors, "Unable to recover the previous installation");
-      }
-      await removeReceipt(stateContext);
-    }
-
-    const installedState = await readInstalledIntegrationState(context);
-    await assertNoNpmCollision(context, installedState);
-    assertMarketplaceSources(context, installedState);
-    await assertSupportedInstallerVersions(context);
-    const receipt = createReceipt(context, installedState);
-    printMutationPlan(context, receipt);
-    await runRequiredCommand(
-      context,
-      context.executables.node,
-      [
-        join(receipt.pluginRoot, "node_modules", "typescript", "bin", "tsc"),
-        "-p",
-        join(receipt.pluginRoot, "tsconfig.json"),
-      ],
-      receipt.pluginRoot,
-    );
-    await writeReceipt(stateContext, receipt);
-    try {
-      await performOwnedStep(
-        stateContext,
-        receipt,
-        "npmLink",
-        receipt.npm.owned,
-        async () => {
-          await runRequiredCommand(
-            context,
-            context.executables.npm,
-            ["link", "--ignore-scripts"],
-            receipt.pluginRoot,
-          );
-        },
-        async () =>
-          (await pathResolvesTo(receipt.npm.packageLinkPath, receipt.pluginRoot)) &&
-          (await pathResolvesTo(
-            receipt.npm.binPaths[0],
-            join(receipt.pluginRoot, "dist", "bin", "codexClaudeBridge.js"),
-          )) &&
-          (await pathResolvesTo(
-            receipt.npm.binPaths[1],
-            join(receipt.pluginRoot, "dist", "bin", "claudeCodeBridgeWrapper.js"),
-          )),
-      );
-      await assertGlobalBridgeCommandIsResolvable(
-        context,
-        receipt.npm.binPaths[0],
-      );
-      await performOwnedStep(
-        stateContext,
-        receipt,
-        "codexMarketplace",
-        receipt.codex.marketplaceOwned,
-        async () => {
-          await runRequiredCommand(context, context.executables.codex, [
-            "plugin",
-            "marketplace",
-            "add",
-            receipt.repositoryRoot,
-            "--json",
-          ]);
-        },
-        async () =>
-          resolve((await readCodexMarketplaceSource(context)) ?? "") ===
-          receipt.repositoryRoot,
-      );
-      await performOwnedStep(
-        stateContext,
-        receipt,
-        "codexPlugin",
-        receipt.codex.pluginOwned,
-        async () => {
-          await runRequiredCommand(context, context.executables.codex, [
-            "plugin",
-            "add",
-            pluginIdentifier,
-            "--json",
-          ]);
-        },
-        async () => readCodexPluginInstalled(context),
-      );
-      await performOwnedStep(
-        stateContext,
-        receipt,
-        "claudeMarketplace",
-        receipt.claude.marketplaceOwned,
-        async () => {
-          await runRequiredCommand(context, context.executables.claude, [
-            "plugin",
-            "marketplace",
-            "add",
-            receipt.repositoryRoot,
-            "--scope",
-            "user",
-          ]);
-        },
-        async () =>
-          resolve((await readClaudeMarketplaceSource(context)) ?? "") ===
-          receipt.repositoryRoot,
-      );
-      await performOwnedStep(
-        stateContext,
-        receipt,
-        "claudePlugin",
-        receipt.claude.pluginOwned,
-        async () => {
-          await runRequiredCommand(context, context.executables.claude, [
-            "plugin",
-            "install",
-            pluginIdentifier,
-            "--scope",
-            "user",
-            "--yes",
-          ]);
-        },
-        async () => readClaudePluginInstalled(context),
-      );
-      await performOwnedStep(
-        stateContext,
-        receipt,
-        "vscodeSetting",
-        receipt.vscode.owned,
-        async () => {
-          await updateJsonStringSetting({
-            settingsPath: receipt.vscode.settingsPath,
-            settingName: wrapperSettingName,
-            value: receipt.wrapperPath,
-          });
-        },
-        async () => {
-          const setting = await readJsonSetting(
-            receipt.vscode.settingsPath,
-            wrapperSettingName,
-          );
-          return setting.present && setting.value === receipt.wrapperPath;
-        },
-      );
-      receipt.phase = "installed";
-      await writeReceipt(stateContext, receipt);
-    } catch (error) {
-      if (error instanceof CommandTerminationUnconfirmedError) {
-        receipt.phase = "rollback_failed";
-        delete receipt.pendingCommandTerminationConfirmed;
-        receipt.commandTerminationUnconfirmed = true;
-        if (error.processGroupIdentifier !== undefined) {
-          receipt.unconfirmedProcessGroupIdentifier =
-            error.processGroupIdentifier;
-        }
-        context.writeOutput(
-          "receipt recovery: preserve the pending step until command termination is confirmed\n",
-        );
-        await writeReceipt(stateContext, receipt);
-        throw error;
-      }
+      const existingReceipt = await readReceipt(stateContext);
       if (
-        receipt.pendingStep !== undefined &&
-        receipt.pendingStep !== "vscodeSetting"
+        existingReceipt?.phase === "installed" ||
+        existingReceipt?.phase === "refreshing"
       ) {
-        receipt.pendingCommandTerminationConfirmed = true;
-        context.writeOutput(
-          `receipt recovery: record confirmed termination for pending ${receipt.pendingStep}\n`,
-        );
-        await writeReceipt(stateContext, receipt);
+        await validateReceiptProvenance(context, existingReceipt);
+        if (existingReceipt.phase === "refreshing" || repairInstalledBridge) {
+          await prepareReceiptForRecovery(context, stateContext, existingReceipt);
+          await refreshInstalledBridge(context, stateContext, existingReceipt);
+          return;
+        }
+        await assertReceiptStillInstalled(context, existingReceipt);
+        context.writeOutput("Bridge integrations are already installed.\n");
+        return;
       }
-      printRemovalPlan(context, receipt);
-      const rollbackErrors = await rollbackInstallation(
-        context,
-        stateContext,
-        receipt,
-      );
-      if (rollbackErrors.length > 0) {
-        receipt.phase = "rollback_failed";
-        await writeReceipt(stateContext, receipt);
-        throw new AggregateError(
-          [error, ...rollbackErrors],
-          `${error instanceof Error ? error.message : "Installation failed"}; rollback failed`,
+      if (existingReceipt !== undefined) {
+        await validateReceiptProvenance(context, existingReceipt);
+        await prepareReceiptForRecovery(context, stateContext, existingReceipt);
+        printRemovalPlan(context, existingReceipt);
+        const recoveryErrors = await rollbackInstallation(
+          context,
+          stateContext,
+          existingReceipt,
         );
+        if (recoveryErrors.length > 0) {
+          existingReceipt.phase = "rollback_failed";
+          await writeReceipt(stateContext, existingReceipt);
+          throw new AggregateError(
+            recoveryErrors,
+            "Unable to recover the previous installation",
+          );
+        }
+        await removeReceipt(stateContext);
       }
-      await removeReceipt(stateContext);
-      throw error;
-    }
+      await performFreshInstallation(context, stateContext);
     },
   );
+}
+
+export async function installBridgeGlobally(
+  options: GlobalInstallerOptions = {},
+): Promise<void> {
+  await applyBridgeInstallation(options, false);
+}
+
+export async function setupBridge(
+  options: GlobalInstallerOptions = {},
+): Promise<DoctorReport> {
+  await applyBridgeInstallation(options, true);
+  return doctorBridgeInstallation(options);
 }
 
 export async function uninstallBridgeGlobally(
@@ -1221,10 +1607,70 @@ function addDoctorCheck(
   });
 }
 
+export function parseClaudeProcessIdentifiers(processListing: string): number[] {
+  const processIdentifiers: number[] = [];
+  for (const line of processListing.split("\n")) {
+    const match = line.match(/^\s*(\d+)\s+(.+)$/u);
+    if (match === null) {
+      continue;
+    }
+    if (match[2].trim().split("/").includes("claude")) {
+      processIdentifiers.push(Number(match[1]));
+    }
+  }
+  return processIdentifiers;
+}
+
+async function listClaudeProcessIdentifiersThroughProcessStatus(
+  context: ResolvedInstallerContext,
+): Promise<number[]> {
+  const result = await context.executeCommand({
+    executablePath: "/bin/ps",
+    arguments: ["-Ao", "pid=,comm="],
+    timeoutMilliseconds: commandTimeoutMilliseconds,
+    maximumOutputBytes: maximumProcessListingBytes,
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `Process listing failed (${result.exitCode}): ${sanitizeCommandError(result.stderr) || "no error output"}`,
+    );
+  }
+  return parseClaudeProcessIdentifiers(result.stdout);
+}
+
+function bridgeIsNotInstalledReport(): DoctorReport {
+  return {
+    ok: false,
+    checks: [
+      {
+        name: "installation",
+        status: "failed",
+        message: "Bridge is not installed; run codex-claude-bridge setup",
+      },
+    ],
+  };
+}
+
 export async function doctorBridgeInstallation(
   options: GlobalInstallerOptions = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
+  try {
+    if (!(await pathExists(installReceiptPath(options.stateHomeDirectory)))) {
+      return bridgeIsNotInstalledReport();
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      checks: [
+        {
+          name: "doctor_runtime",
+          status: "failed",
+          message: error instanceof Error ? error.message : "Doctor failed",
+        },
+      ],
+    };
+  }
   let context: ResolvedInstallerContext;
   try {
     context = await resolveInstallerContext(options);
@@ -1326,13 +1772,34 @@ export async function doctorBridgeInstallation(
         : `Codex ${detectedCodexVersion} does not expose stable hook trust status in plugin JSON output`,
   });
   try {
-    const activeSessions = await context.listActiveSessions();
+    const readonlyReceipt = await readReceiptReadonly(stateHomeDirectory);
+    const globalBinaryDirectory = dirname(readonlyReceipt.receipt.npm.binPaths[0]);
+    const globalBinaryDirectoryIsInPath = context.environmentPath
+      .split(delimiter)
+      .includes(globalBinaryDirectory);
+    checks.push({
+      name: "global_bin_path",
+      status: globalBinaryDirectoryIsInPath ? "passed" : "info",
+      message: globalBinaryDirectoryIsInPath
+        ? `Global bin directory ${globalBinaryDirectory} is in PATH; Codex and Claude must inherit it`
+        : `Global bin directory ${globalBinaryDirectory} is not in PATH; Codex and Claude must inherit it`,
+    });
+  } catch (error) {
+    checks.push({
+      name: "global_bin_path",
+      status: "info",
+      message: error instanceof Error ? error.message : "PATH check failed",
+    });
+  }
+  let activeSessions: ActiveSessionRecord[] | undefined;
+  try {
+    activeSessions = await context.listActiveSessions();
     checks.push({
       name: "active_sessions",
       status: activeSessions.length === 0 ? "info" : "passed",
       message:
         activeSessions.length === 0
-          ? "No active bridge sessions; this is informational"
+          ? "No active bridge sessions; start one with codex-claude-bridge launch claude or codex-claude-bridge launch codex"
           : `${activeSessions.length} active bridge sessions`,
     });
   } catch (error) {
@@ -1340,6 +1807,44 @@ export async function doctorBridgeInstallation(
       name: "active_sessions",
       status: "failed",
       message: error instanceof Error ? error.message : "Session inspection failed",
+    });
+  }
+  try {
+    const runningClaudeProcessIdentifiers = await (
+      options.listRunningClaudeProcessIdentifiers ??
+      (() => listClaudeProcessIdentifiersThroughProcessStatus(context))
+    )();
+    if (activeSessions === undefined) {
+      checks.push({
+        name: "claude_channel_coverage",
+        status: "info",
+        message:
+          "Registered Claude sessions are unavailable; running Claude processes were not compared",
+      });
+    } else {
+      const registeredProcessIdentifiers = new Set(
+        activeSessions
+          .filter((session) => session.runtime === "claude")
+          .map((session) => session.processId),
+      );
+      const unregisteredProcessCount = runningClaudeProcessIdentifiers.filter(
+        (processIdentifier) =>
+          !registeredProcessIdentifiers.has(processIdentifier),
+      ).length;
+      checks.push({
+        name: "claude_channel_coverage",
+        status: unregisteredProcessCount === 0 ? "passed" : "info",
+        message:
+          unregisteredProcessCount === 0
+            ? "Every running Claude process is registered with the bridge Channel"
+            : `${unregisteredProcessCount} running Claude processes have no bridge Channel; start them with codex-claude-bridge launch claude`,
+      });
+    }
+  } catch (error) {
+    checks.push({
+      name: "claude_channel_coverage",
+      status: "info",
+      message: `Running Claude processes were not inspected: ${error instanceof Error ? error.message : "unknown error"}`,
     });
   }
   return {

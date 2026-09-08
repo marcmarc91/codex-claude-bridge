@@ -25,9 +25,21 @@ export type InstallationStep =
   | "claudePlugin"
   | "vscodeSetting";
 
+export interface VscodeSettingsTarget {
+  settingsPath: string;
+  previous: JsonSettingSnapshot;
+  installedValue: string;
+  owned: boolean;
+}
+
 export interface InstallationReceipt {
   schemaVersion: 1;
-  phase: "installing" | "installed" | "uninstalling" | "rollback_failed";
+  phase:
+    | "installing"
+    | "installed"
+    | "refreshing"
+    | "uninstalling"
+    | "rollback_failed";
   installationId: string;
   repositoryRoot: string;
   pluginRoot: string;
@@ -41,12 +53,7 @@ export interface InstallationReceipt {
     binPaths: string[];
     owned: boolean;
   };
-  vscode: {
-    settingsPath: string;
-    previous: JsonSettingSnapshot;
-    installedValue: string;
-    owned: boolean;
-  };
+  vscodeTargets: VscodeSettingsTarget[];
   codex: {
     marketplaceOwned: boolean;
     pluginOwned: boolean;
@@ -82,10 +89,31 @@ const installationStepSchema = z.enum([
   "vscodeSetting",
 ]);
 
-const receiptSchema: z.ZodType<InstallationReceipt> = z
+const vscodeSettingsTargetSchema = z
+  .object({
+    settingsPath: z.string().min(1),
+    previous: z
+      .object({
+        fileExisted: z.boolean(),
+        present: z.boolean(),
+        value: z.string().optional(),
+      })
+      .strict(),
+    installedValue: z.string().min(1),
+    owned: z.boolean(),
+  })
+  .strict();
+
+const receiptSchema: z.ZodType<InstallationReceipt, z.ZodTypeDef, unknown> = z
   .object({
     schemaVersion: z.literal(1),
-    phase: z.enum(["installing", "installed", "uninstalling", "rollback_failed"]),
+    phase: z.enum([
+      "installing",
+      "installed",
+      "refreshing",
+      "uninstalling",
+      "rollback_failed",
+    ]),
     installationId: z.string().uuid(),
     repositoryRoot: z.string().min(1),
     pluginRoot: z.string().min(1),
@@ -101,20 +129,8 @@ const receiptSchema: z.ZodType<InstallationReceipt> = z
         owned: z.boolean(),
       })
       .strict(),
-    vscode: z
-      .object({
-        settingsPath: z.string().min(1),
-        previous: z
-          .object({
-            fileExisted: z.boolean(),
-            present: z.boolean(),
-            value: z.string().optional(),
-          })
-          .strict(),
-        installedValue: z.string().min(1),
-        owned: z.boolean(),
-      })
-      .strict(),
+    vscode: vscodeSettingsTargetSchema.optional(),
+    vscodeTargets: z.array(vscodeSettingsTargetSchema).optional(),
     codex: z
       .object({ marketplaceOwned: z.boolean(), pluginOwned: z.boolean() })
       .strict(),
@@ -133,6 +149,11 @@ const receiptSchema: z.ZodType<InstallationReceipt> = z
     unconfirmedProcessGroupIdentifier: z.number().int().positive().optional(),
   })
   .strict()
+  .transform(({ vscode, vscodeTargets, ...receipt }) => ({
+    ...receipt,
+    vscodeTargets:
+      vscodeTargets ?? (vscode === undefined ? [] : [vscode]),
+  }))
   .superRefine((receipt, context) => {
     const stepOwnership: Record<InstallationStep, boolean> = {
       npmLink: receipt.npm.owned,
@@ -140,34 +161,34 @@ const receiptSchema: z.ZodType<InstallationReceipt> = z
       codexPlugin: receipt.codex.pluginOwned,
       claudeMarketplace: receipt.claude.marketplaceOwned,
       claudePlugin: receipt.claude.pluginOwned,
-      vscodeSetting: receipt.vscode.owned,
+      vscodeSetting: receipt.vscodeTargets.some((target) => target.owned),
     };
-    if (
-      receipt.vscode.previous.present &&
-      (!receipt.vscode.previous.fileExisted ||
-        receipt.vscode.previous.value === undefined)
-    ) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "Prior VS Code setting snapshot is inconsistent",
-      });
-    }
-    if (
-      !receipt.vscode.previous.present &&
-      receipt.vscode.previous.value !== undefined
-    ) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "Absent prior VS Code setting must not contain a value",
-      });
+    for (const target of receipt.vscodeTargets) {
+      if (
+        target.previous.present &&
+        (!target.previous.fileExisted || target.previous.value === undefined)
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Prior VS Code setting snapshot is inconsistent",
+        });
+      }
+      if (!target.previous.present && target.previous.value !== undefined) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Absent prior VS Code setting must not contain a value",
+        });
+      }
     }
     if (
       receipt.commandTerminationUnconfirmed !== undefined &&
-      receipt.phase !== "rollback_failed"
+      receipt.phase !== "rollback_failed" &&
+      receipt.phase !== "refreshing"
     ) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "Unconfirmed process group requires rollback_failed phase",
+        message:
+          "Unconfirmed process group requires the rollback_failed or refreshing phase",
       });
     }
     if (

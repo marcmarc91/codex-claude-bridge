@@ -172,6 +172,8 @@ function createDependencies(
     installBridgeGlobally: async () => undefined,
     uninstallBridgeGlobally: async () => undefined,
     doctorBridgeInstallation: async () => ({ ok: true, checks: [] }),
+    setupBridge: async () => ({ ok: true, checks: [] }),
+    launchBridgeRuntime: async () => 0,
     ...overrides,
   };
 }
@@ -464,6 +466,100 @@ test("routes global install and uninstall commands only with the explicit global
   assert.deepEqual(calls, ["install:false", "uninstall:true"]);
   assert.equal((await runCommand(["install"], dependencies)).exitCode, 1);
   assert.equal((await runCommand(["uninstall", "--project"], dependencies)).exitCode, 1);
+});
+
+test("runs setup with optional editor integration and prints the launch next steps", async () => {
+  const setupCalls: unknown[] = [];
+  const dependencies = Object.assign(createDependencies(), {
+    setupBridge: async (
+      _writeOutput: (value: string) => void,
+      setupOptions: unknown,
+    ) => {
+      setupCalls.push(setupOptions);
+      return {
+        ok: true,
+        checks: [
+          { name: "active_sessions", status: "info" as const, message: "none active" },
+        ],
+      };
+    },
+  });
+
+  const defaultResult = await runCommand(["setup"], dependencies);
+  const explicitResult = await runCommand(
+    ["setup", "--vscode-settings", "/tmp/settings.json"],
+    dependencies,
+  );
+  const disabledResult = await runCommand(["setup", "--no-vscode"], dependencies);
+  const conflictingResult = await runCommand(
+    ["setup", "--no-vscode", "--vscode-settings", "/tmp/settings.json"],
+    dependencies,
+  );
+
+  assert.equal(defaultResult.exitCode, 0);
+  assert.equal(explicitResult.exitCode, 0);
+  assert.equal(disabledResult.exitCode, 0);
+  assert.equal(conflictingResult.exitCode, 1);
+  assert.match(conflictingResult.stderr, /cannot be combined/u);
+  assert.deepEqual(setupCalls, [
+    { configureVscode: true, confirmPendingCommandStopped: false },
+    {
+      configureVscode: true,
+      vscodeSettingsPath: "/tmp/settings.json",
+      confirmPendingCommandStopped: false,
+    },
+    { configureVscode: false, confirmPendingCommandStopped: false },
+  ]);
+  assert.match(defaultResult.stdout, /INFO\tactive_sessions\tnone active/u);
+  assert.match(defaultResult.stdout, /codex-claude-bridge launch claude/u);
+  assert.match(defaultResult.stdout, /codex-claude-bridge launch codex/u);
+});
+
+test("returns a failing setup exit code when the doctor report fails", async () => {
+  const dependencies = Object.assign(createDependencies(), {
+    setupBridge: async () => ({
+      ok: false,
+      checks: [
+        { name: "integrations", status: "failed" as const, message: "drifted" },
+      ],
+    }),
+  });
+
+  const result = await runCommand(["setup"], dependencies);
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stdout, /FAILED\tintegrations\tdrifted/u);
+});
+
+test("passes launch arguments verbatim to the selected runtime and returns its exit code", async () => {
+  const launchCalls: { runtime: string; argumentsList: string[] }[] = [];
+  const dependencies = Object.assign(createDependencies(), {
+    launchBridgeRuntime: async (runtime: string, argumentsList: string[]) => {
+      launchCalls.push({ runtime, argumentsList });
+      return runtime === "codex" ? 7 : 0;
+    },
+  });
+
+  const claudeResult = await runCommand(
+    ["launch", "claude", "--", "--resume", "--json"],
+    dependencies,
+  );
+  const codexResult = await runCommand(
+    ["launch", "codex", "exec", "--sandbox", "read-only"],
+    dependencies,
+  );
+  const unknownRuntimeResult = await runCommand(["launch", "gemini"], dependencies);
+  const missingRuntimeResult = await runCommand(["launch"], dependencies);
+
+  assert.equal(claudeResult.exitCode, 0);
+  assert.equal(codexResult.exitCode, 7);
+  assert.equal(unknownRuntimeResult.exitCode, 1);
+  assert.equal(missingRuntimeResult.exitCode, 1);
+  assert.match(unknownRuntimeResult.stderr, /launch <claude\|codex>/u);
+  assert.deepEqual(launchCalls, [
+    { runtime: "claude", argumentsList: ["--", "--resume", "--json"] },
+    { runtime: "codex", argumentsList: ["exec", "--sandbox", "read-only"] },
+  ]);
 });
 
 test("formats doctor checks and returns non-zero only for required failures", async () => {
@@ -812,7 +908,7 @@ test("starts and cleans up the exact Claude MCP manifest command through a globa
     { capabilities: {} },
   );
   await client.connect(transport);
-  assert.equal((await client.listTools()).tools.length, 3);
+  assert.equal((await client.listTools()).tools.length, 4);
 
   const projectIdentifier = await resolveProjectIdentity(packageDirectory);
   let registeredSession: ActiveSessionRecord | undefined;

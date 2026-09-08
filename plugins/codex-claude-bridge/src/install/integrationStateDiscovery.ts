@@ -7,7 +7,6 @@ import {
   type CommandExecutionResult,
 } from "./commandExecution.js";
 import type { InstallerExecutables } from "./executableResolver.js";
-import { readJsonSetting, type JsonSettingSnapshot } from "./jsonSettingsEditor.js";
 
 export interface InstalledIntegrationState {
   npmPrefix: string;
@@ -18,13 +17,11 @@ export interface InstalledIntegrationState {
   codexPluginInstalled: boolean;
   claudeMarketplaceSource?: string;
   claudePluginInstalled: boolean;
-  vscodeSetting: JsonSettingSnapshot;
 }
 
 export interface IntegrationDiscoveryContext {
   repositoryRoot: string;
   pluginRoot: string;
-  vscodeSettingsPath: string;
   executables: InstallerExecutables;
   executeCommand: (
     request: CommandExecutionRequest,
@@ -34,7 +31,6 @@ export interface IntegrationDiscoveryContext {
 const marketplaceName = "codex-claude-bridge-local";
 const pluginName = "codex-claude-bridge";
 const pluginIdentifier = `${pluginName}@${marketplaceName}`;
-const wrapperSettingName = "claudeCode.claudeProcessWrapper";
 const commandTimeoutMilliseconds = 15_000;
 const maximumCommandOutputBytes = 65_536;
 
@@ -315,10 +311,6 @@ export async function readInstalledIntegrationState(
     codexPluginInstalled: await readCodexPluginInstalled(context),
     claudeMarketplaceSource: await readClaudeMarketplaceSource(context),
     claudePluginInstalled: await readClaudePluginInstalled(context),
-    vscodeSetting: await readJsonSetting(
-      context.vscodeSettingsPath,
-      wrapperSettingName,
-    ),
   };
 }
 

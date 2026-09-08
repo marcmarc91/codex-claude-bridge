@@ -17,6 +17,7 @@ import { runCodexSessionHookFromStandardInput } from "../hooks/codexSessionHook.
 import {
   doctorBridgeInstallation,
   installBridgeGlobally,
+  setupBridge,
   uninstallBridgeGlobally,
   type DoctorReport,
 } from "../install/globalInstaller.js";
@@ -33,6 +34,16 @@ import {
   type ActiveSessionRecord,
 } from "../registry/activeSessionRegistry.js";
 import { resolveProjectIdentity } from "../registry/projectIdentity.js";
+import {
+  launchBridgeRuntime,
+  type BridgeRuntimeName,
+} from "../wrapper/runtimeLauncher.js";
+
+export interface BridgeSetupCommandOptions {
+  configureVscode: boolean;
+  vscodeSettingsPath?: string;
+  confirmPendingCommandStopped: boolean;
+}
 
 export interface CommandLineDependencies {
   currentWorkingDirectory: string;
@@ -57,6 +68,14 @@ export interface CommandLineDependencies {
     confirmPendingCommandStopped: boolean,
   ) => Promise<void>;
   doctorBridgeInstallation: () => Promise<DoctorReport>;
+  setupBridge: (
+    writeOutput: (value: string) => void,
+    setupOptions: BridgeSetupCommandOptions,
+  ) => Promise<DoctorReport>;
+  launchBridgeRuntime: (
+    runtime: BridgeRuntimeName,
+    argumentsList: string[],
+  ) => Promise<number>;
   stateHomeDirectory?: string;
 }
 
@@ -426,6 +445,9 @@ function createDefaultDependencies(): CommandLineDependencies {
     uninstallBridgeGlobally: (writeOutput, confirmPendingCommandStopped) =>
       uninstallBridgeGlobally({ writeOutput, confirmPendingCommandStopped }),
     doctorBridgeInstallation: () => doctorBridgeInstallation(),
+    setupBridge: (writeOutput, setupOptions) =>
+      setupBridge({ writeOutput, ...setupOptions }),
+    launchBridgeRuntime,
   };
 }
 
@@ -446,6 +468,47 @@ function writeDoctorReport(
       )
       .join("\n")}\n`,
   );
+}
+
+function parseSetupOptions(argumentsList: string[]): BridgeSetupCommandOptions {
+  const options = parseOptions(argumentsList, {
+    "--no-vscode": { takesValue: false },
+    "--vscode-settings": { takesValue: true },
+    "--confirm-pending-command-stopped": { takesValue: false },
+  });
+  const vscodeSettingsPath = options["--vscode-settings"];
+  if (options["--no-vscode"] === true && vscodeSettingsPath !== undefined) {
+    throw new TypeError(
+      "Arguments --no-vscode and --vscode-settings cannot be combined",
+    );
+  }
+  return {
+    configureVscode: options["--no-vscode"] !== true,
+    ...(typeof vscodeSettingsPath === "string" ? { vscodeSettingsPath } : {}),
+    confirmPendingCommandStopped:
+      options["--confirm-pending-command-stopped"] === true,
+  };
+}
+
+function writeSetupNextSteps(writeOutput: (value: string) => void): void {
+  writeOutput(
+    [
+      "Next steps:",
+      "  codex-claude-bridge launch claude",
+      "  codex-claude-bridge launch codex",
+      "Approve the Claude development Channel prompt and the Codex hook-trust prompt once per machine.",
+      "",
+    ].join("\n"),
+  );
+}
+
+function parseLaunchRuntime(runtimeName: string | undefined): BridgeRuntimeName {
+  if (runtimeName !== "claude" && runtimeName !== "codex") {
+    throw new TypeError(
+      "Usage: codex-claude-bridge launch <claude|codex> [runtime arguments...]",
+    );
+  }
+  return runtimeName;
 }
 
 export async function runCommandLine(options: RunCommandLineOptions): Promise<number> {
@@ -472,6 +535,22 @@ export async function runCommandLine(options: RunCommandLineOptions): Promise<nu
         parseOptions(commandArguments, {});
         await dependencies.startClaudeChannelServer();
         break;
+      case "setup": {
+        const report = await dependencies.setupBridge(
+          writeOutput,
+          parseSetupOptions(commandArguments),
+        );
+        writeDoctorReport(report, false, writeOutput);
+        writeSetupNextSteps(writeOutput);
+        return report.ok ? 0 : 1;
+      }
+      case "launch": {
+        const [runtimeName, ...runtimeArguments] = commandArguments;
+        return await dependencies.launchBridgeRuntime(
+          parseLaunchRuntime(runtimeName),
+          runtimeArguments,
+        );
+      }
       case "install":
         {
           const installOptions = parseOptions(commandArguments, {

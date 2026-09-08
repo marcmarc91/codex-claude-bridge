@@ -21,12 +21,15 @@ import { writeReceipt } from "../src/install/installationReceiptStore.js";
 import {
   doctorBridgeInstallation,
   installBridgeGlobally,
+  parseClaudeProcessIdentifiers,
   resolveClaudeExecutable,
+  setupBridge,
   uninstallBridgeGlobally,
   type CommandExecutionRequest,
   type CommandExecutionResult,
   type GlobalInstallerOptions,
 } from "../src/install/globalInstaller.js";
+import type { ActiveSessionRecord } from "../src/registry/activeSessionRegistry.js";
 
 const marketplaceName = "codex-claude-bridge-local";
 const pluginIdentifier = `codex-claude-bridge@${marketplaceName}`;
@@ -47,6 +50,7 @@ async function createTestOptions(testContext: test.TestContext): Promise<{
   settingsPath: string;
   stateHomeDirectory: string;
   repositoryRoot: string;
+  homeDirectory: string;
   failCommand: (predicate: (request: CommandExecutionRequest) => boolean) => void;
   failAfterCommand: (predicate: (request: CommandExecutionRequest) => boolean) => void;
   setPreexistingExactIntegrations: () => Promise<void>;
@@ -241,6 +245,7 @@ async function createTestOptions(testContext: test.TestContext): Promise<{
     settingsPath,
     stateHomeDirectory,
     repositoryRoot,
+    homeDirectory,
     failCommand: (predicate) => {
       failurePredicate = predicate;
     },
@@ -325,7 +330,7 @@ test("installs in the documented order, writes a private receipt, and is idempot
   const receiptPath = join(fixture.stateHomeDirectory, "codex-claude-bridge", "install-receipt.json");
   const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
   assert.equal(receipt.phase, "installed");
-  assert.equal(receipt.vscode.previous.present, false);
+  assert.equal(receipt.vscodeTargets[0].previous.present, false);
   assert.equal((await lstat(receiptPath)).mode & 0o777, 0o600);
   assert.match(await readFile(fixture.settingsPath, "utf8"), /\/\/ keep/u);
   const mutationCountAfterFirstInstall = fixture.commands.filter(
@@ -934,7 +939,7 @@ test("does not claim or remove integrations that already match exactly", async (
   assert.equal(receipt.codex.pluginOwned, false);
   assert.equal(receipt.claude.marketplaceOwned, false);
   assert.equal(receipt.claude.pluginOwned, false);
-  assert.equal(receipt.vscode.owned, false);
+  assert.equal(receipt.vscodeTargets[0].owned, false);
   fixture.commands.length = 0;
 
   await uninstallBridgeGlobally(fixture.options);
@@ -984,9 +989,9 @@ for (const failureStep of [
   });
 }
 
-test("preserves a user setting added to a settings file created by install", async (testContext) => {
+test("preserves a user setting added to a settings file managed by install", async (testContext) => {
   const fixture = await createTestOptions(testContext);
-  await rm(fixture.settingsPath);
+  await writeFile(fixture.settingsPath, "{}\n");
   await installBridgeGlobally(fixture.options);
   const installedSettings = JSON.parse(await readFile(fixture.settingsPath, "utf8"));
   await writeFile(
@@ -1010,7 +1015,7 @@ test("rejects a tampered receipt target before any uninstall mutation", async (t
     "install-receipt.json",
   );
   const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
-  receipt.vscode.settingsPath = join(dirname(fixture.settingsPath), "other.json");
+  receipt.vscodeTargets[0].settingsPath = join(dirname(fixture.settingsPath), "other.json");
   await writeFile(receiptPath, JSON.stringify(receipt));
   await chmod(receiptPath, 0o600);
   fixture.commands.length = 0;
@@ -1313,7 +1318,7 @@ test("rejects impossible prior-setting receipt state before uninstall mutations"
     "install-receipt.json",
   );
   const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
-  receipt.vscode.previous = { fileExisted: false, present: true, value: "/impossible" };
+  receipt.vscodeTargets[0].previous = { fileExisted: false, present: true, value: "/impossible" };
   await writeFile(receiptPath, JSON.stringify(receipt));
   await chmod(receiptPath, 0o600);
   fixture.commands.length = 0;
@@ -1842,3 +1847,666 @@ async function pathExistsForTest(candidatePath: string): Promise<boolean> {
     return false;
   }
 }
+
+function claudeSessionRecord(processIdentifier: number): ActiveSessionRecord {
+  return {
+    schemaVersion: 1,
+    runtime: "claude",
+    sessionId: "ad65b1c1-7386-4465-80f9-4de0a26bc212",
+    displayName: "claude-local",
+    processId: processIdentifier,
+    workingDirectory: "/projects/local",
+    projectId: "0123456789abcdef01234567",
+    socketPath: "/state/sockets/session.sock",
+    registeredAt: "2026-09-04T10:00:00.000Z",
+  };
+}
+
+function readReceiptForTest(stateHomeDirectory: string): {
+  phase: string;
+  installationId: string;
+  wrapperPath: string;
+  npm: { binPaths: string[] };
+  completedSteps: string[];
+  vscodeTargets: {
+    settingsPath: string;
+    owned: boolean;
+    previous: { fileExisted: boolean; present: boolean; value?: string };
+  }[];
+} {
+  return JSON.parse(
+    readFileSync(
+      join(stateHomeDirectory, "codex-claude-bridge", "install-receipt.json"),
+      "utf8",
+    ),
+  );
+}
+
+function mutationSignaturesOf(commands: CommandExecutionRequest[]): string[] {
+  return commands
+    .filter(
+      ({ arguments: argumentsList }) =>
+        ["link", "unlink"].includes(argumentsList[0] ?? "") ||
+        ["add", "install", "remove", "uninstall"].includes(argumentsList[1] ?? "") ||
+        ["add", "remove"].includes(argumentsList[2] ?? ""),
+    )
+    .map(
+      ({ executablePath, arguments: argumentsList }) =>
+        `${executablePath.split("/").at(-1)} ${argumentsList.join(" ")}`,
+    );
+}
+
+test("setup installs a missing bridge and returns a passing doctor report", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+
+  const report = await setupBridge({
+    ...fixture.options,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  });
+
+  assert.equal(report.ok, true);
+  assert.equal(readReceiptForTest(fixture.stateHomeDirectory).phase, "installed");
+  assert.equal(
+    report.checks.find(({ name }) => name === "global_bin_path")?.status,
+    "passed",
+  );
+  assert.equal(
+    report.checks.find(({ name }) => name === "active_sessions")?.status,
+    "info",
+  );
+  assert.match(
+    report.checks.find(({ name }) => name === "active_sessions")?.message ?? "",
+    /codex-claude-bridge launch claude/u,
+  );
+});
+
+test("setup keeps the receipt and repairs only the integrations that drifted", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  const setupOptions = {
+    ...fixture.options,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  };
+  await setupBridge(setupOptions);
+  const installationId = readReceiptForTest(fixture.stateHomeDirectory).installationId;
+
+  fixture.commands.length = 0;
+  fixture.output.length = 0;
+  const idempotentReport = await setupBridge(setupOptions);
+  const idempotentMutations = mutationSignaturesOf(fixture.commands);
+  const idempotentOutput = fixture.output.join("");
+
+  fixture.state.claudePluginInstalled = false;
+  fixture.commands.length = 0;
+  fixture.output.length = 0;
+  const repairReport = await setupBridge(setupOptions);
+
+  assert.equal(idempotentReport.ok, true);
+  assert.deepEqual(idempotentMutations, []);
+  assert.match(idempotentOutput, /already installed/u);
+  assert.equal(repairReport.ok, true);
+  assert.deepEqual(mutationSignaturesOf(fixture.commands), [
+    `claude plugin install ${pluginIdentifier} --scope user --yes`,
+  ]);
+  assert.equal(fixture.state.claudePluginInstalled, true);
+  const receipt = readReceiptForTest(fixture.stateHomeDirectory);
+  assert.equal(receipt.installationId, installationId);
+  assert.equal(receipt.phase, "installed");
+});
+
+test("setup records an editor installed after the first run and uninstall restores it", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  const { vscodeSettingsPath: _explicitSettingsPath, ...discoveringOptions } =
+    fixture.options;
+  const setupOptions = {
+    ...discoveringOptions,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  };
+  await setupBridge(setupOptions);
+  const firstReceipt = readReceiptForTest(fixture.stateHomeDirectory);
+  const windsurfSettingsDirectory = join(
+    fixture.homeDirectory,
+    "Library",
+    "Application Support",
+    "Windsurf",
+    "User",
+  );
+  await mkdir(windsurfSettingsDirectory, { recursive: true });
+  const windsurfSettingsPath = join(windsurfSettingsDirectory, "settings.json");
+  await writeFile(windsurfSettingsPath, "{}\n");
+
+  const report = await setupBridge(setupOptions);
+
+  assert.equal(report.ok, true);
+  const refreshedReceipt = readReceiptForTest(fixture.stateHomeDirectory);
+  assert.deepEqual(firstReceipt.vscodeTargets.map(({ settingsPath }) => settingsPath), [
+    fixture.settingsPath,
+  ]);
+  assert.deepEqual(
+    refreshedReceipt.vscodeTargets.map(({ settingsPath }) => settingsPath),
+    [fixture.settingsPath, windsurfSettingsPath],
+  );
+  assert.equal(refreshedReceipt.installationId, firstReceipt.installationId);
+  assert.equal(refreshedReceipt.phase, "installed");
+  assert.equal(
+    JSON.parse(await readFile(windsurfSettingsPath, "utf8"))[
+      "claudeCode.claudeProcessWrapper"
+    ],
+    refreshedReceipt.wrapperPath,
+  );
+
+  await uninstallBridgeGlobally(discoveringOptions);
+
+  assert.doesNotMatch(
+    await readFile(windsurfSettingsPath, "utf8"),
+    /claudeProcessWrapper/u,
+  );
+  assert.doesNotMatch(
+    await readFile(fixture.settingsPath, "utf8"),
+    /claudeProcessWrapper/u,
+  );
+});
+
+test("setup configures every discovered editor and uninstall restores each settings file", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  const cursorSettingsDirectory = join(
+    fixture.homeDirectory,
+    "Library",
+    "Application Support",
+    "Cursor",
+    "User",
+  );
+  await mkdir(cursorSettingsDirectory, { recursive: true });
+  const cursorSettingsPath = join(cursorSettingsDirectory, "settings.json");
+  await writeFile(cursorSettingsPath, "{}\n");
+  const { vscodeSettingsPath: _explicitSettingsPath, ...discoveringOptions } =
+    fixture.options;
+
+  const report = await setupBridge({
+    ...discoveringOptions,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  });
+
+  assert.equal(report.ok, true);
+  const receipt = readReceiptForTest(fixture.stateHomeDirectory);
+  assert.deepEqual(
+    receipt.vscodeTargets.map(({ settingsPath }) => settingsPath),
+    [fixture.settingsPath, cursorSettingsPath],
+  );
+  assert.ok(receipt.wrapperPath.endsWith("/bin/claude-code-bridge-wrapper"));
+  assert.match(
+    await readFile(fixture.settingsPath, "utf8"),
+    /claudeCode\.claudeProcessWrapper/u,
+  );
+  assert.equal(
+    JSON.parse(await readFile(cursorSettingsPath, "utf8"))[
+      "claudeCode.claudeProcessWrapper"
+    ],
+    receipt.wrapperPath,
+  );
+
+  await uninstallBridgeGlobally(discoveringOptions);
+
+  assert.doesNotMatch(
+    await readFile(fixture.settingsPath, "utf8"),
+    /claudeProcessWrapper/u,
+  );
+  assert.doesNotMatch(
+    await readFile(cursorSettingsPath, "utf8"),
+    /claudeProcessWrapper/u,
+  );
+});
+
+test("setup skips editor integration without a discovered editor and with --no-vscode", async (testContext) => {
+  const editorlessFixture = await createTestOptions(testContext);
+  const {
+    vscodeSettingsPath: _editorlessSettingsPath,
+    ...editorlessOptions
+  } = editorlessFixture.options;
+  await rm(join(editorlessFixture.homeDirectory, "Library"), {
+    recursive: true,
+    force: true,
+  });
+
+  const editorlessReport = await setupBridge({
+    ...editorlessOptions,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  });
+
+  assert.equal(editorlessReport.ok, true);
+  const editorlessReceipt = readReceiptForTest(editorlessFixture.stateHomeDirectory);
+  assert.deepEqual(editorlessReceipt.vscodeTargets, []);
+  assert.equal(editorlessReceipt.completedSteps.includes("vscodeSetting"), false);
+
+  const disabledFixture = await createTestOptions(testContext);
+  const { vscodeSettingsPath: _disabledSettingsPath, ...disabledOptions } =
+    disabledFixture.options;
+
+  const disabledReport = await setupBridge({
+    ...disabledOptions,
+    configureVscode: false,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  });
+
+  assert.equal(disabledReport.ok, true);
+  assert.deepEqual(
+    readReceiptForTest(disabledFixture.stateHomeDirectory).vscodeTargets,
+    [],
+  );
+  assert.doesNotMatch(
+    await readFile(disabledFixture.settingsPath, "utf8"),
+    /claudeProcessWrapper/u,
+  );
+});
+
+test("doctor reports a missing installation in one line without inspecting integrations", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+
+  const report = await doctorBridgeInstallation(fixture.options);
+
+  assert.equal(report.ok, false);
+  assert.deepEqual(report.checks, [
+    {
+      name: "installation",
+      status: "failed",
+      message: "Bridge is not installed; run codex-claude-bridge setup",
+    },
+  ]);
+  assert.deepEqual(fixture.commands, []);
+});
+
+test("doctor warns about a global bin directory that is missing from PATH", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  await installBridgeGlobally(fixture.options);
+
+  const report = await doctorBridgeInstallation({
+    ...fixture.options,
+    environmentPath: "/usr/bin",
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  });
+
+  const globalBinaryPathCheck = report.checks.find(
+    ({ name }) => name === "global_bin_path",
+  );
+  assert.equal(globalBinaryPathCheck?.status, "info");
+  assert.match(
+    globalBinaryPathCheck?.message ?? "",
+    /is not in PATH; Codex and Claude must inherit it/u,
+  );
+});
+
+test("doctor counts running Claude processes that are not registered with the Channel", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  await installBridgeGlobally(fixture.options);
+
+  const coveredReport = await doctorBridgeInstallation({
+    ...fixture.options,
+    listActiveSessions: async () => [claudeSessionRecord(4242)],
+    listRunningClaudeProcessIdentifiers: async () => [4242],
+  });
+  const uncoveredReport = await doctorBridgeInstallation({
+    ...fixture.options,
+    listActiveSessions: async () => [claudeSessionRecord(4242)],
+    listRunningClaudeProcessIdentifiers: async () => [4242, 5150, 6161],
+  });
+
+  assert.equal(
+    coveredReport.checks.find(({ name }) => name === "claude_channel_coverage")
+      ?.status,
+    "passed",
+  );
+  const uncoveredCheck = uncoveredReport.checks.find(
+    ({ name }) => name === "claude_channel_coverage",
+  );
+  assert.equal(uncoveredCheck?.status, "info");
+  assert.match(
+    uncoveredCheck?.message ?? "",
+    /2 running Claude processes have no bridge Channel/u,
+  );
+  assert.equal(uncoveredReport.ok, true);
+});
+
+test("reads Claude process identifiers from a process listing", () => {
+  assert.deepEqual(
+    parseClaudeProcessIdentifiers(
+      [
+        "  501 /opt/homebrew/bin/claude",
+        " 502 claude",
+        "503 /Users/example/.local/share/claude/versions/2.1.263",
+        "504 /Applications/Claude.app/Contents/Helpers/chrome-native-host",
+        "505 codex",
+        "506 /usr/local/bin/claude-code-bridge-wrapper",
+        "not a process line",
+        "",
+      ].join("\n"),
+    ),
+    [501, 502, 503],
+  );
+});
+
+test("setup keeps a working installation intact when its refresh build fails", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  const setupOptions = {
+    ...fixture.options,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  };
+  await setupBridge(setupOptions);
+  const receiptPath = join(
+    fixture.stateHomeDirectory,
+    "codex-claude-bridge",
+    "install-receipt.json",
+  );
+  const installedReceiptText = await readFile(receiptPath, "utf8");
+  fixture.state.claudePluginInstalled = false;
+  fixture.commands.length = 0;
+  fixture.failCommand(
+    ({ executablePath, arguments: argumentsList }) =>
+      executablePath === process.execPath && argumentsList[0] !== "--version",
+  );
+
+  await assert.rejects(setupBridge(setupOptions), /Command failed \(19\)/u);
+
+  assert.equal(await readFile(receiptPath, "utf8"), installedReceiptText);
+  assert.deepEqual(mutationSignaturesOf(fixture.commands), []);
+  assert.equal(fixture.state.npmLinked, true);
+  assert.equal(fixture.state.codexPluginInstalled, true);
+});
+
+test("setup resumes a failed refresh step without rolling back the installation", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  const setupOptions = {
+    ...fixture.options,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  };
+  await setupBridge(setupOptions);
+  const installationId = readReceiptForTest(fixture.stateHomeDirectory).installationId;
+  fixture.state.claudePluginInstalled = false;
+  fixture.failCommand(
+    ({ arguments: argumentsList }) =>
+      argumentsList[0] === "plugin" && argumentsList[1] === "install",
+  );
+
+  await assert.rejects(setupBridge(setupOptions), /Command failed \(19\)/u);
+
+  const interruptedReceipt = JSON.parse(
+    readFileSync(
+      join(fixture.stateHomeDirectory, "codex-claude-bridge", "install-receipt.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(interruptedReceipt.phase, "refreshing");
+  assert.equal(interruptedReceipt.pendingStep, "claudePlugin");
+  assert.equal(interruptedReceipt.installationId, installationId);
+  assert.equal(fixture.state.npmLinked, true);
+  assert.equal(fixture.state.codexMarketplaceSource, fixture.repositoryRoot);
+
+  fixture.failCommand(() => false);
+  fixture.commands.length = 0;
+  const recoveryReport = await setupBridge(setupOptions);
+
+  assert.equal(recoveryReport.ok, true);
+  assert.deepEqual(mutationSignaturesOf(fixture.commands), [
+    `claude plugin install ${pluginIdentifier} --scope user --yes`,
+  ]);
+  const recoveredReceipt = readReceiptForTest(fixture.stateHomeDirectory);
+  assert.equal(recoveredReceipt.phase, "installed");
+  assert.equal(recoveredReceipt.installationId, installationId);
+});
+
+test("setup refuses to repair a drifted integration when another checkout owns a marketplace", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  const setupOptions = {
+    ...fixture.options,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  };
+  await setupBridge(setupOptions);
+  fixture.state.claudePluginInstalled = false;
+  fixture.state.codexMarketplaceSource = join(fixture.repositoryRoot, "..", "other-checkout");
+  fixture.commands.length = 0;
+
+  await assert.rejects(setupBridge(setupOptions), /marketplace source collision/u);
+
+  assert.deepEqual(mutationSignaturesOf(fixture.commands), []);
+  assert.equal(fixture.state.claudePluginInstalled, false);
+});
+
+test("setup refuses to repair an npm link that another package owns", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  const setupOptions = {
+    ...fixture.options,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  };
+  await setupBridge(setupOptions);
+  const receipt = readReceiptForTest(fixture.stateHomeDirectory);
+  const packageLinkPath = join(
+    dirname(dirname(receipt.npm.binPaths[0])),
+    "lib",
+    "node_modules",
+    "codex-claude-bridge",
+  );
+  const foreignPackageRoot = join(fixture.repositoryRoot, "..", "foreign-package");
+  await mkdir(foreignPackageRoot, { recursive: true });
+  await unlink(packageLinkPath);
+  await symlink(foreignPackageRoot, packageLinkPath);
+  fixture.commands.length = 0;
+
+  await assert.rejects(setupBridge(setupOptions), /npm global package source collision/u);
+
+  assert.deepEqual(mutationSignaturesOf(fixture.commands), []);
+});
+
+test("doctor reads a bounded process listing by command name and degrades to information", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  await installBridgeGlobally(fixture.options);
+  const processListingRequests: CommandExecutionRequest[] = [];
+  const executeCommand = fixture.options.executeCommand!;
+  const largeProcessListing = `${Array.from(
+    { length: 4000 },
+    (_unused, index) => `${index + 1} /Applications/Other.app/Contents/MacOS/Other`,
+  ).join("\n")}\n4242 /Users/example/.local/share/claude/versions/2.1.263\n`;
+
+  const inspectedReport = await doctorBridgeInstallation({
+    ...fixture.options,
+    listActiveSessions: async () => [],
+    executeCommand: async (request) => {
+      if (request.executablePath === "/bin/ps") {
+        processListingRequests.push(request);
+        return { exitCode: 0, stdout: largeProcessListing, stderr: "" };
+      }
+      return executeCommand(request);
+    },
+  });
+  const failedReport = await doctorBridgeInstallation({
+    ...fixture.options,
+    listActiveSessions: async () => [],
+    executeCommand: async (request) => {
+      if (request.executablePath === "/bin/ps") {
+        return { exitCode: 1, stdout: "", stderr: "ps failed" };
+      }
+      return executeCommand(request);
+    },
+  });
+
+  assert.deepEqual(processListingRequests[0]?.arguments, ["-Ao", "pid=,comm="]);
+  assert.ok(
+    (processListingRequests[0]?.maximumOutputBytes ?? 0) >
+      Buffer.byteLength(largeProcessListing),
+  );
+  const inspectedCheck = inspectedReport.checks.find(
+    ({ name }) => name === "claude_channel_coverage",
+  );
+  assert.equal(inspectedCheck?.status, "info");
+  assert.match(inspectedCheck?.message ?? "", /1 running Claude processes/u);
+  const failedCheck = failedReport.checks.find(
+    ({ name }) => name === "claude_channel_coverage",
+  );
+  assert.equal(failedCheck?.status, "info");
+  assert.match(
+    failedCheck?.message ?? "",
+    /Running Claude processes were not inspected: Process listing failed \(1\)/u,
+  );
+  assert.equal(failedReport.ok, true);
+});
+
+test("setup with --no-vscode records no editor target and leaves settings untouched", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  await writeFile(fixture.settingsPath, "{ broken");
+  const { vscodeSettingsPath: _explicitSettingsPath, ...discoveringOptions } =
+    fixture.options;
+
+  const report = await setupBridge({
+    ...discoveringOptions,
+    configureVscode: false,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  });
+
+  assert.equal(report.ok, true);
+  assert.deepEqual(readReceiptForTest(fixture.stateHomeDirectory).vscodeTargets, []);
+  assert.equal(await readFile(fixture.settingsPath, "utf8"), "{ broken");
+});
+
+test("setup skips a discovered editor with unreadable settings and configures the others", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  const cursorSettingsDirectory = join(
+    fixture.homeDirectory,
+    "Library",
+    "Application Support",
+    "Cursor",
+    "User",
+  );
+  await mkdir(cursorSettingsDirectory, { recursive: true });
+  const cursorSettingsPath = join(cursorSettingsDirectory, "settings.json");
+  await writeFile(cursorSettingsPath, "{ broken");
+  const { vscodeSettingsPath: _explicitSettingsPath, ...discoveringOptions } =
+    fixture.options;
+
+  const report = await setupBridge({
+    ...discoveringOptions,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  });
+
+  assert.equal(report.ok, true);
+  assert.deepEqual(
+    readReceiptForTest(fixture.stateHomeDirectory).vscodeTargets.map(
+      ({ settingsPath }) => settingsPath,
+    ),
+    [fixture.settingsPath],
+  );
+  assert.match(
+    fixture.output.join(""),
+    /are unreadable: VS Code settings contain invalid JSONC; skipping this editor/u,
+  );
+  assert.equal(await readFile(cursorSettingsPath, "utf8"), "{ broken");
+  assert.match(
+    await readFile(fixture.settingsPath, "utf8"),
+    /claudeProcessWrapper/u,
+  );
+});
+
+test("setup re-snapshots a user-changed wrapper so uninstall restores that value", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  const setupOptions = {
+    ...fixture.options,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  };
+  await setupBridge(setupOptions);
+  await writeFile(
+    fixture.settingsPath,
+    JSON.stringify({ "claudeCode.claudeProcessWrapper": "/user/wrapper" }, null, 2),
+  );
+
+  const report = await setupBridge(setupOptions);
+
+  assert.equal(report.ok, true);
+  const receipt = readReceiptForTest(fixture.stateHomeDirectory);
+  assert.deepEqual(receipt.vscodeTargets[0].previous, {
+    fileExisted: true,
+    present: true,
+    value: "/user/wrapper",
+  });
+  assert.equal(
+    JSON.parse(await readFile(fixture.settingsPath, "utf8"))[
+      "claudeCode.claudeProcessWrapper"
+    ],
+    receipt.wrapperPath,
+  );
+
+  await uninstallBridgeGlobally(fixture.options);
+
+  assert.equal(
+    JSON.parse(await readFile(fixture.settingsPath, "utf8"))[
+      "claudeCode.claudeProcessWrapper"
+    ],
+    "/user/wrapper",
+  );
+});
+
+test("setup ignores an editor directory without settings and rejects a missing explicit path", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  await mkdir(
+    join(fixture.homeDirectory, "Library", "Application Support", "Windsurf", "User"),
+    { recursive: true },
+  );
+  const { vscodeSettingsPath: _explicitSettingsPath, ...discoveringOptions } =
+    fixture.options;
+
+  const report = await setupBridge({
+    ...discoveringOptions,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  });
+
+  assert.equal(report.ok, true);
+  assert.deepEqual(
+    readReceiptForTest(fixture.stateHomeDirectory).vscodeTargets.map(
+      ({ settingsPath }) => settingsPath,
+    ),
+    [fixture.settingsPath],
+  );
+  assert.equal(
+    existsSync(
+      join(
+        fixture.homeDirectory,
+        "Library",
+        "Application Support",
+        "Windsurf",
+        "User",
+        "settings.json",
+      ),
+    ),
+    false,
+  );
+
+  const missingExplicitFixture = await createTestOptions(testContext);
+  const missingSettingsPath = join(
+    missingExplicitFixture.homeDirectory,
+    "Library",
+    "Application Support",
+    "Code",
+    "User",
+    "absent.json",
+  );
+
+  await assert.rejects(
+    setupBridge({
+      ...missingExplicitFixture.options,
+      vscodeSettingsPath: missingSettingsPath,
+    }),
+    new RegExp(`VS Code settings file does not exist: ${missingSettingsPath}`, "u"),
+  );
+
+  assert.equal(existsSync(missingSettingsPath), false);
+});

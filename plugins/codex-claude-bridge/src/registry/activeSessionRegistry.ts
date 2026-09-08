@@ -180,11 +180,13 @@ async function processIsActive(processIdentifier: number): Promise<boolean> {
   }
 }
 
-export async function probeUnixSocket(socketPath: string): Promise<boolean> {
+export type UnixSocketProbeOutcome = "accepting" | "refused" | "unknown";
+
+export async function probeUnixSocketOutcome(socketPath: string): Promise<UnixSocketProbeOutcome> {
   return new Promise((resolveProbe) => {
     const socket = connect(socketPath);
     let probeFinished = false;
-    const finishProbe = (socketAccepted: boolean) => {
+    const finishProbe = (outcome: UnixSocketProbeOutcome) => {
       if (probeFinished) {
         return;
       }
@@ -192,14 +194,20 @@ export async function probeUnixSocket(socketPath: string): Promise<boolean> {
       probeFinished = true;
       clearTimeout(timeoutHandle);
       socket.destroy();
-      resolveProbe(socketAccepted);
+      resolveProbe(outcome);
     };
-    const timeoutHandle = setTimeout(() => finishProbe(false), 200);
+    const timeoutHandle = setTimeout(() => finishProbe("unknown"), 200);
 
-    socket.once("connect", () => finishProbe(true));
-    socket.once("error", () => finishProbe(false));
-    socket.once("close", () => finishProbe(false));
+    socket.once("connect", () => finishProbe("accepting"));
+    socket.once("error", (error: NodeJS.ErrnoException) =>
+      finishProbe(error.code === "ECONNREFUSED" || error.code === "ENOENT" ? "refused" : "unknown"),
+    );
+    socket.once("close", () => finishProbe("unknown"));
   });
+}
+
+export async function probeUnixSocket(socketPath: string): Promise<boolean> {
+  return (await probeUnixSocketOutcome(socketPath)) === "accepting";
 }
 
 async function socketIsActive(

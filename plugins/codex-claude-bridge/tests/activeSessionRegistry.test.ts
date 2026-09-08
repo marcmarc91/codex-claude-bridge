@@ -373,3 +373,27 @@ test("înregistrarea și dezînregistrarea concurente păstrează proprietarul p
     "fresh-owner",
   );
 });
+
+test("probeUnixSocketOutcome distinge acceptarea, refuzul cert și cazul incert", async () => {
+  const { mkdtemp, rm, writeFile } = await import("node:fs/promises");
+  const { probeUnixSocketOutcome } = await import("../src/registry/activeSessionRegistry.js");
+  const probeDirectory = await mkdtemp(join(tmpdir(), "ccb-probe-"));
+  const listeningSocketPath = join(probeDirectory, "live.sock");
+  const missingSocketPath = join(probeDirectory, "missing.sock");
+  const orphanedSocketPath = join(probeDirectory, "orphan.sock");
+  const listeningServer = createServer();
+  await new Promise<void>((resolveListen) => listeningServer.listen(listeningSocketPath, resolveListen));
+  const orphanedServer = createServer();
+  await new Promise<void>((resolveListen) => orphanedServer.listen(orphanedSocketPath, resolveListen));
+  await new Promise<void>((resolveClose) => orphanedServer.close(() => resolveClose()));
+  await writeFile(orphanedSocketPath, "");
+
+  try {
+    assert.equal(await probeUnixSocketOutcome(listeningSocketPath), "accepting");
+    assert.equal(await probeUnixSocketOutcome(missingSocketPath), "refused");
+    assert.equal(await probeUnixSocketOutcome(orphanedSocketPath), "unknown");
+  } finally {
+    await new Promise<void>((resolveClose) => listeningServer.close(() => resolveClose()));
+    await rm(probeDirectory, { recursive: true, force: true });
+  }
+});

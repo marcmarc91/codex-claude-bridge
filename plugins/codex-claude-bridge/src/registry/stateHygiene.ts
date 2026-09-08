@@ -5,7 +5,7 @@ import { uuidSchema } from "../protocol/messageEnvelope.js";
 import { projectIdentitySchema } from "../runtime/paths.js";
 import {
   listActiveSessions,
-  probeUnixSocket,
+  probeUnixSocketOutcome,
 } from "./activeSessionRegistry.js";
 import {
   ensurePrivateBridgeDirectory,
@@ -169,10 +169,14 @@ async function cleanupOrphanedSockets(
       continue;
     }
 
-    if (await probeUnixSocket(socketPath)) {
+    const probeOutcome = await probeUnixSocketOutcome(socketPath);
+    if (probeOutcome !== "refused") {
       skipped.push({
         path: socketPath,
-        reason: "socket still accepts connections",
+        reason:
+          probeOutcome === "accepting"
+            ? "socket still accepts connections"
+            : "socket liveness could not be determined",
       });
       continue;
     }

@@ -2415,7 +2415,7 @@ test("setup skips a discovered editor with unreadable settings and configures th
   );
 });
 
-test("setup re-snapshots a user-changed wrapper so uninstall restores that value", async (testContext) => {
+test("setup leaves an owned wrapper that changed after installation and keeps its receipt entry", async (testContext) => {
   const fixture = await createTestOptions(testContext);
   const setupOptions = {
     ...fixture.options,
@@ -2423,25 +2423,30 @@ test("setup re-snapshots a user-changed wrapper so uninstall restores that value
     listRunningClaudeProcessIdentifiers: async () => [],
   };
   await setupBridge(setupOptions);
+  const installedReceipt = readReceiptForTest(fixture.stateHomeDirectory);
   await writeFile(
     fixture.settingsPath,
     JSON.stringify({ "claudeCode.claudeProcessWrapper": "/user/wrapper" }, null, 2),
   );
+  fixture.commands.length = 0;
+  fixture.output.length = 0;
 
-  const report = await setupBridge(setupOptions);
+  await setupBridge(setupOptions);
 
-  assert.equal(report.ok, true);
-  const receipt = readReceiptForTest(fixture.stateHomeDirectory);
-  assert.deepEqual(receipt.vscodeTargets[0].previous, {
-    fileExisted: true,
-    present: true,
-    value: "/user/wrapper",
-  });
   assert.equal(
     JSON.parse(await readFile(fixture.settingsPath, "utf8"))[
       "claudeCode.claudeProcessWrapper"
     ],
-    receipt.wrapperPath,
+    "/user/wrapper",
+  );
+  assert.deepEqual(
+    readReceiptForTest(fixture.stateHomeDirectory).vscodeTargets,
+    installedReceipt.vscodeTargets,
+  );
+  assert.deepEqual(mutationSignaturesOf(fixture.commands), []);
+  assert.match(
+    fixture.output.join(""),
+    /was changed after installation; leaving it unchanged/u,
   );
 
   await uninstallBridgeGlobally(fixture.options);
@@ -2452,6 +2457,75 @@ test("setup re-snapshots a user-changed wrapper so uninstall restores that value
     ],
     "/user/wrapper",
   );
+});
+
+test("setup --no-vscode leaves a recorded editor target untouched", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  const { vscodeSettingsPath: _explicitSettingsPath, ...discoveringOptions } =
+    fixture.options;
+  const setupOptions = {
+    ...discoveringOptions,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  };
+  await setupBridge(setupOptions);
+  const installedReceipt = readReceiptForTest(fixture.stateHomeDirectory);
+  assert.equal(installedReceipt.vscodeTargets[0].owned, true);
+  await writeFile(
+    fixture.settingsPath,
+    JSON.stringify({ "claudeCode.claudeProcessWrapper": "/user/wrapper" }, null, 2),
+  );
+  const settingsTextBeforeRefresh = await readFile(fixture.settingsPath, "utf8");
+  fixture.commands.length = 0;
+
+  await setupBridge({ ...setupOptions, configureVscode: false });
+
+  assert.equal(await readFile(fixture.settingsPath, "utf8"), settingsTextBeforeRefresh);
+  assert.deepEqual(
+    readReceiptForTest(fixture.stateHomeDirectory).vscodeTargets,
+    installedReceipt.vscodeTargets,
+  );
+  assert.deepEqual(mutationSignaturesOf(fixture.commands), []);
+
+  await uninstallBridgeGlobally(discoveringOptions);
+
+  assert.equal(
+    JSON.parse(await readFile(fixture.settingsPath, "utf8"))[
+      "claudeCode.claudeProcessWrapper"
+    ],
+    "/user/wrapper",
+  );
+});
+
+test("setup never takes over an editor target the bridge does not own", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  await fixture.setPreexistingExactIntegrations();
+  await installBridgeGlobally(fixture.options);
+  const installedReceipt = readReceiptForTest(fixture.stateHomeDirectory);
+  assert.equal(installedReceipt.vscodeTargets[0].owned, false);
+  await writeFile(
+    fixture.settingsPath,
+    JSON.stringify({ "claudeCode.claudeProcessWrapper": "/other/wrapper" }, null, 2),
+  );
+  fixture.commands.length = 0;
+
+  await setupBridge({
+    ...fixture.options,
+    listActiveSessions: async () => [],
+    listRunningClaudeProcessIdentifiers: async () => [],
+  });
+
+  assert.equal(
+    JSON.parse(await readFile(fixture.settingsPath, "utf8"))[
+      "claudeCode.claudeProcessWrapper"
+    ],
+    "/other/wrapper",
+  );
+  assert.deepEqual(
+    readReceiptForTest(fixture.stateHomeDirectory).vscodeTargets,
+    installedReceipt.vscodeTargets,
+  );
+  assert.deepEqual(mutationSignaturesOf(fixture.commands), []);
 });
 
 test("setup ignores an editor directory without settings and rejects a missing explicit path", async (testContext) => {

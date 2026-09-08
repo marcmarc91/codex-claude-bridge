@@ -213,10 +213,10 @@ async function resolveInstallerContext(
       claude: await resolveClaudeExecutable({ homeDirectory, environmentPath }),
     };
   const vscodeSettingsPaths =
-    options.vscodeSettingsPath !== undefined
-      ? [options.vscodeSettingsPath]
-      : options.configureVscode === false
-        ? []
+    options.configureVscode === false
+      ? []
+      : options.vscodeSettingsPath !== undefined
+        ? [options.vscodeSettingsPath]
         : await discoverVscodeUserSettingsPaths(homeDirectory, process.platform);
   return {
     repositoryRoot,
@@ -315,26 +315,32 @@ async function createVscodeSettingsTargets(
   return targets;
 }
 
-async function resnapshotVscodeSettingsTargets(
-  targets: VscodeSettingsTarget[],
-  wrapperPath: string,
-): Promise<VscodeSettingsTarget[]> {
-  const resnapshotTargets: VscodeSettingsTarget[] = [];
-  for (const target of targets) {
-    const currentSetting = await readVscodeSetting(target.settingsPath);
-    resnapshotTargets.push(
-      currentSetting.present && currentSetting.value === wrapperPath
-        ? target
-        : vscodeSettingsTarget(target.settingsPath, currentSetting, wrapperPath),
-    );
-  }
-  return resnapshotTargets;
-}
-
-function ownedVscodeSettingsTargets(
+function managedVscodeSettingsTargets(
+  context: ResolvedInstallerContext,
   receipt: InstallationReceipt,
 ): VscodeSettingsTarget[] {
-  return receipt.vscodeTargets.filter((target) => target.owned);
+  return receipt.vscodeTargets.filter(
+    (target) =>
+      target.owned &&
+      context.vscodeSettingsPaths.includes(target.settingsPath),
+  );
+}
+
+function classifyVscodeSettingsTarget(
+  target: VscodeSettingsTarget,
+  currentSetting: JsonSettingSnapshot,
+  wrapperPath: string,
+): "installed" | "repairable" | "userChanged" {
+  if (currentSetting.present && currentSetting.value === wrapperPath) {
+    return "installed";
+  }
+  if (
+    currentSetting.present === target.previous.present &&
+    currentSetting.value === target.previous.value
+  ) {
+    return "repairable";
+  }
+  return "userChanged";
 }
 
 async function createReceipt(
@@ -425,7 +431,7 @@ function installationStepPlanLine(
     case "claudePlugin":
       return `Claude plugin: ${context.executables.claude} plugin install ${pluginIdentifier} --scope user --yes`;
     case "vscodeSetting":
-      return `VS Code setting: ${ownedVscodeSettingsTargets(receipt)
+      return `VS Code setting: ${managedVscodeSettingsTargets(context, receipt)
         .map((target) => target.settingsPath)
         .join(", ")} -> ${receipt.wrapperPath}`;
   }
@@ -1119,12 +1125,31 @@ async function assertSupportedInstallerVersions(
   }
 }
 
+function writeUserChangedVscodeSettingWarning(
+  context: ResolvedInstallerContext,
+  target: VscodeSettingsTarget,
+): void {
+  context.writeOutput(
+    `VS Code wrapper at ${target.settingsPath} was changed after installation; leaving it unchanged.\n`,
+  );
+}
+
 async function writeVscodeSettingsTarget(
+  context: ResolvedInstallerContext,
   target: VscodeSettingsTarget,
   wrapperPath: string,
 ): Promise<void> {
   const currentSetting = await readVscodeSetting(target.settingsPath);
-  if (currentSetting.present && currentSetting.value === wrapperPath) {
+  const targetState = classifyVscodeSettingsTarget(
+    target,
+    currentSetting,
+    wrapperPath,
+  );
+  if (targetState === "installed") {
+    return;
+  }
+  if (targetState === "userChanged") {
+    writeUserChangedVscodeSettingWarning(context, target);
     return;
   }
   const recordedValue = target.previous.value;
@@ -1252,14 +1277,20 @@ function installationStepOperations(
     },
     vscodeSetting: {
       apply: async () => {
-        for (const target of ownedVscodeSettingsTargets(receipt)) {
-          await writeVscodeSettingsTarget(target, receipt.wrapperPath);
+        for (const target of managedVscodeSettingsTargets(context, receipt)) {
+          await writeVscodeSettingsTarget(context, target, receipt.wrapperPath);
         }
       },
       verify: async () => {
-        for (const target of ownedVscodeSettingsTargets(receipt)) {
-          const setting = await readVscodeSetting(target.settingsPath);
-          if (!setting.present || setting.value !== receipt.wrapperPath) {
+        for (const target of managedVscodeSettingsTargets(context, receipt)) {
+          const currentSetting = await readVscodeSetting(target.settingsPath);
+          if (
+            classifyVscodeSettingsTarget(
+              target,
+              currentSetting,
+              receipt.wrapperPath,
+            ) === "repairable"
+          ) {
             return false;
           }
         }
@@ -1425,6 +1456,24 @@ async function collectDriftedSteps(
   );
 }
 
+async function warnAboutUserChangedVscodeTargets(
+  context: ResolvedInstallerContext,
+  receipt: InstallationReceipt,
+): Promise<void> {
+  for (const target of managedVscodeSettingsTargets(context, receipt)) {
+    const currentSetting = await readVscodeSetting(target.settingsPath);
+    if (
+      classifyVscodeSettingsTarget(
+        target,
+        currentSetting,
+        receipt.wrapperPath,
+      ) === "userChanged"
+    ) {
+      writeUserChangedVscodeSettingWarning(context, target);
+    }
+  }
+}
+
 async function markReceiptInstalled(
   stateContext: SecureBridgeStateContext,
   receipt: InstallationReceipt,
@@ -1448,13 +1497,11 @@ async function refreshInstalledBridge(
   receipt: InstallationReceipt,
 ): Promise<void> {
   const installedState = await readInstalledIntegrationState(context);
-  const refreshedTargets = [
-    ...(await resnapshotVscodeSettingsTargets(
-      receipt.vscodeTargets,
-      receipt.wrapperPath,
-    )),
-    ...(await discoverUnrecordedVscodeTargets(context, receipt)),
-  ];
+  const unrecordedTargets = await discoverUnrecordedVscodeTargets(
+    context,
+    receipt,
+  );
+  const refreshedTargets = [...receipt.vscodeTargets, ...unrecordedTargets];
   const refreshedReceipt: InstallationReceipt = {
     ...receipt,
     vscodeTargets: refreshedTargets,
@@ -1464,9 +1511,10 @@ async function refreshInstalledBridge(
     refreshedReceipt,
     installedState,
   );
-  const recordedTargetsChanged =
-    JSON.stringify(refreshedTargets) !== JSON.stringify(receipt.vscodeTargets);
-  if (!recordedTargetsChanged && driftedSteps.length === 0) {
+  if (!driftedSteps.includes("vscodeSetting")) {
+    await warnAboutUserChangedVscodeTargets(context, refreshedReceipt);
+  }
+  if (unrecordedTargets.length === 0 && driftedSteps.length === 0) {
     await markReceiptInstalled(stateContext, receipt);
     context.writeOutput("Bridge integrations are already installed.\n");
     return;

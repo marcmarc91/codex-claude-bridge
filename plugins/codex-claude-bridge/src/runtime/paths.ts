@@ -6,6 +6,9 @@ import { uuidSchema } from "../protocol/messageEnvelope.js";
 
 export const projectIdentitySchema = z.string().regex(/^[a-f0-9]{24}$/);
 
+export const maximumChannelSocketPathUtf8Bytes = 103;
+const socketDirectoryOverrideEnvironmentVariableName = "CODEX_CLAUDE_BRIDGE_SOCKET_DIR";
+
 function validateStateHomeDirectory(stateHomeDirectory: string): string {
   if (!isAbsolute(stateHomeDirectory) || stateHomeDirectory.includes("\0")) {
     throw new TypeError("State home directory must be an absolute path without NUL bytes");
@@ -14,12 +17,15 @@ function validateStateHomeDirectory(stateHomeDirectory: string): string {
   return stateHomeDirectory;
 }
 
-function resolveStateHomeDirectory(injectedStateHomeDirectory?: string): string {
+export function resolveStateHomeDirectory(
+  injectedStateHomeDirectory?: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): string {
   if (injectedStateHomeDirectory !== undefined) {
     return validateStateHomeDirectory(injectedStateHomeDirectory);
   }
 
-  const environmentStateHomeDirectory = process.env.XDG_STATE_HOME;
+  const environmentStateHomeDirectory = environment.XDG_STATE_HOME;
   if (
     environmentStateHomeDirectory === undefined ||
     environmentStateHomeDirectory.length === 0
@@ -60,8 +66,43 @@ export function normalizeConversationIdentifier(
   return validationResult.data.toLowerCase();
 }
 
-export function resolveBridgeStateDirectory(stateHomeDirectory?: string): string {
-  return join(resolveStateHomeDirectory(stateHomeDirectory), "codex-claude-bridge");
+export function resolveBridgeStateDirectory(
+  stateHomeDirectory?: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): string {
+  return join(
+    resolveStateHomeDirectory(stateHomeDirectory, environment),
+    "codex-claude-bridge",
+  );
+}
+
+export function resolveSocketsDirectory(
+  stateHomeDirectory?: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): string {
+  const socketDirectoryOverride = environment[socketDirectoryOverrideEnvironmentVariableName];
+  if (socketDirectoryOverride !== undefined && socketDirectoryOverride.length > 0) {
+    if (!isAbsolute(socketDirectoryOverride) || socketDirectoryOverride.includes("\0")) {
+      throw new TypeError(
+        `${socketDirectoryOverrideEnvironmentVariableName} must be an absolute path without NUL bytes`,
+      );
+    }
+    return resolve(socketDirectoryOverride);
+  }
+
+  return resolveContainedDirectory(
+    resolveBridgeStateDirectory(stateHomeDirectory, environment),
+    "sockets",
+  );
+}
+
+export function assertSocketPathWithinLimit(socketPath: string): void {
+  const socketPathByteLength = Buffer.byteLength(socketPath, "utf8");
+  if (socketPathByteLength > maximumChannelSocketPathUtf8Bytes) {
+    throw new RangeError(
+      `Channel socket path must not exceed ${maximumChannelSocketPathUtf8Bytes} UTF-8 bytes but was ${socketPathByteLength}; set ${socketDirectoryOverrideEnvironmentVariableName} to a shorter absolute directory to fix this`,
+    );
+  }
 }
 
 export function resolveSessionRegistryDirectory(

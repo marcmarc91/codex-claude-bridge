@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import type { ActiveSessionRecord } from "../registry/activeSessionRegistry.js";
 import type { SecureBridgeStateContext } from "../registry/secureStateFilesystem.js";
+import { resolveStateHomeDirectory } from "../runtime/paths.js";
 import {
   CommandTerminationUnconfirmedError,
   executeBoundedCommand,
@@ -221,8 +222,7 @@ async function resolveInstallerContext(
 }
 
 function printStatePreparationPlan(context: ResolvedInstallerContext): void {
-  const stateHomeDirectory =
-    context.stateHomeDirectory ?? join(context.homeDirectory, ".local", "state");
+  const stateHomeDirectory = resolveStateHomeDirectory(context.stateHomeDirectory);
   const bridgeStateDirectory = join(
     stateHomeDirectory,
     "codex-claude-bridge",
@@ -321,7 +321,7 @@ function printMutationPlan(
     lines.push(`VS Code setting: ${receipt.vscode.settingsPath} -> ${receipt.wrapperPath}`);
   }
   lines.push(
-    `receipt: ${join(context.stateHomeDirectory ?? join(context.homeDirectory, ".local", "state"), "codex-claude-bridge", "install-receipt.json")}`,
+    `receipt: ${join(resolveStateHomeDirectory(context.stateHomeDirectory), "codex-claude-bridge", "install-receipt.json")}`,
   );
   context.writeOutput(`${lines.join("\n")}\n`);
 }
@@ -398,7 +398,7 @@ function printRemovalPlan(
     }
   });
   lines.push(
-    `receipt updates: ${join(context.stateHomeDirectory ?? join(context.homeDirectory, ".local", "state"), "codex-claude-bridge", "install-receipt.json")}`,
+    `receipt updates: ${join(resolveStateHomeDirectory(context.stateHomeDirectory), "codex-claude-bridge", "install-receipt.json")}`,
   );
   context.writeOutput(`${lines.join("\n")}\n`);
 }
@@ -1267,8 +1267,7 @@ export async function doctorBridgeInstallation(
     }
   }
 
-  const stateHomeDirectory =
-    context.stateHomeDirectory ?? join(context.homeDirectory, ".local", "state");
+  const stateHomeDirectory = resolveStateHomeDirectory(context.stateHomeDirectory);
   try {
     const readonlyReceipt = await readReceiptReadonly(stateHomeDirectory);
     addDoctorCheck(

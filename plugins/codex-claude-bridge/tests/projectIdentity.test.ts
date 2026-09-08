@@ -7,10 +7,14 @@ import { promisify } from "node:util";
 import test from "node:test";
 
 import {
+  assertSocketPathWithinLimit,
+  maximumChannelSocketPathUtf8Bytes,
   resolveBridgeStateDirectory,
   resolveConversationDirectory,
   resolveConversationRecordPath,
   resolveSessionRegistryDirectory,
+  resolveSocketsDirectory,
+  resolveStateHomeDirectory,
 } from "../src/runtime/paths.js";
 import { parseAgentMessageEnvelope } from "../src/protocol/messageEnvelope.js";
 import { resolveProjectIdentity } from "../src/registry/projectIdentity.js";
@@ -202,5 +206,123 @@ test("păstrează rădăcinile absolute valide injectate", () => {
   assert.equal(
     resolveBridgeStateDirectory(absoluteStateHomeDirectory),
     join(absoluteStateHomeDirectory, "codex-claude-bridge"),
+  );
+});
+
+test("resolveStateHomeDirectory respectă XDG_STATE_HOME dintr-un obiect de mediu injectat", () => {
+  const environmentStateHomeDirectory = join(tmpdir(), "ccb-injected-environment-state");
+
+  assert.equal(
+    resolveStateHomeDirectory(undefined, { XDG_STATE_HOME: environmentStateHomeDirectory }),
+    environmentStateHomeDirectory,
+  );
+});
+
+test("resolveStateHomeDirectory ignoră XDG_STATE_HOME din process.env când mediul injectat nu îl conține", (testContext) => {
+  const originalStateHomeDirectory = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = join(tmpdir(), "ccb-real-process-env-state");
+  testContext.after(() => {
+    if (originalStateHomeDirectory === undefined) {
+      delete process.env.XDG_STATE_HOME;
+    } else {
+      process.env.XDG_STATE_HOME = originalStateHomeDirectory;
+    }
+  });
+
+  assert.equal(
+    resolveStateHomeDirectory(undefined, {}),
+    join(homedir(), ".local", "state"),
+  );
+});
+
+test("rădăcina de stare injectată are prioritate față de XDG_STATE_HOME din mediu", () => {
+  const injectedStateHomeDirectory = join(tmpdir(), "ccb-injected-override-state");
+  const environmentStateHomeDirectory = join(tmpdir(), "ccb-ignored-environment-state");
+
+  assert.equal(
+    resolveStateHomeDirectory(injectedStateHomeDirectory, {
+      XDG_STATE_HOME: environmentStateHomeDirectory,
+    }),
+    injectedStateHomeDirectory,
+  );
+});
+
+test("resolveBridgeStateDirectory propagă mediul injectat către rezolvarea XDG", () => {
+  const environmentStateHomeDirectory = join(tmpdir(), "ccb-bridge-environment-state");
+
+  assert.equal(
+    resolveBridgeStateDirectory(undefined, { XDG_STATE_HOME: environmentStateHomeDirectory }),
+    join(environmentStateHomeDirectory, "codex-claude-bridge"),
+  );
+});
+
+test("resolveSocketsDirectory folosește <stateDir>/sockets fără CODEX_CLAUDE_BRIDGE_SOCKET_DIR", () => {
+  const stateHomeDirectory = join(tmpdir(), "ccb-sockets-default-state");
+
+  assert.equal(
+    resolveSocketsDirectory(stateHomeDirectory, {}),
+    join(stateHomeDirectory, "codex-claude-bridge", "sockets"),
+  );
+});
+
+test("resolveSocketsDirectory tratează CODEX_CLAUDE_BRIDGE_SOCKET_DIR gol ca absent", () => {
+  const stateHomeDirectory = join(tmpdir(), "ccb-sockets-empty-override-state");
+
+  assert.equal(
+    resolveSocketsDirectory(stateHomeDirectory, { CODEX_CLAUDE_BRIDGE_SOCKET_DIR: "" }),
+    join(stateHomeDirectory, "codex-claude-bridge", "sockets"),
+  );
+});
+
+test("resolveSocketsDirectory respectă CODEX_CLAUDE_BRIDGE_SOCKET_DIR absolut", () => {
+  const stateHomeDirectory = join(tmpdir(), "ccb-sockets-override-state");
+  const socketDirectoryOverride = join(tmpdir(), "ccb-sockets-override-target");
+
+  assert.equal(
+    resolveSocketsDirectory(stateHomeDirectory, {
+      CODEX_CLAUDE_BRIDGE_SOCKET_DIR: socketDirectoryOverride,
+    }),
+    socketDirectoryOverride,
+  );
+});
+
+test("resolveSocketsDirectory respinge CODEX_CLAUDE_BRIDGE_SOCKET_DIR relativ sau cu NUL fără a reveni la directorul implicit", () => {
+  const stateHomeDirectory = join(tmpdir(), "ccb-sockets-invalid-override-state");
+
+  for (const invalidSocketDirectoryOverride of ["relative-sockets", "  ", "/tmp/invalid\0sockets"]) {
+    assert.throws(
+      () =>
+        resolveSocketsDirectory(stateHomeDirectory, {
+          CODEX_CLAUDE_BRIDGE_SOCKET_DIR: invalidSocketDirectoryOverride,
+        }),
+      TypeError,
+    );
+  }
+});
+
+test("assertSocketPathWithinLimit acceptă căi în limita de octeți UTF-8", () => {
+  const shortSocketPath = join(tmpdir(), "c-0123456789abcdef.sock");
+
+  assert.doesNotThrow(() => assertSocketPathWithinLimit(shortSocketPath));
+});
+
+test("assertSocketPathWithinLimit aruncă RangeError cu limita, lungimea efectivă și variabila de remediu", () => {
+  const oversizedSocketPath = join(
+    "/",
+    "a".repeat(200),
+    "c-0123456789abcdef.sock",
+  );
+  const expectedByteLength = Buffer.byteLength(oversizedSocketPath, "utf8");
+
+  assert.throws(
+    () => assertSocketPathWithinLimit(oversizedSocketPath),
+    (error: unknown) => {
+      assert.ok(error instanceof RangeError);
+      const message = (error as Error).message;
+      assert.ok(message.includes(String(maximumChannelSocketPathUtf8Bytes)));
+      assert.ok(message.includes(String(expectedByteLength)));
+      assert.ok(message.includes("CODEX_CLAUDE_BRIDGE_SOCKET_DIR"));
+      return true;
+    },
   );
 });

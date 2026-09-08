@@ -1801,6 +1801,39 @@ test("serializes install and uninstall so uninstall observes the completed recei
   );
 });
 
+test("install și doctor derivă același director de stare implicit din XDG_STATE_HOME când stateHomeDirectory nu este injectat", async (testContext) => {
+  const fixture = await createTestOptions(testContext);
+  const xdgStateHomeDirectory = join(dirname(fixture.stateHomeDirectory), "xdg-state-home");
+  const originalXdgStateHomeDirectory = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = xdgStateHomeDirectory;
+  testContext.after(() => {
+    if (originalXdgStateHomeDirectory === undefined) {
+      delete process.env.XDG_STATE_HOME;
+    } else {
+      process.env.XDG_STATE_HOME = originalXdgStateHomeDirectory;
+    }
+  });
+  const { stateHomeDirectory: _omittedStateHomeDirectory, ...optionsWithoutStateHomeDirectory } =
+    fixture.options;
+
+  await installBridgeGlobally(optionsWithoutStateHomeDirectory);
+
+  const bridgeStateDirectory = join(xdgStateHomeDirectory, "codex-claude-bridge");
+  const receiptPath = join(bridgeStateDirectory, "install-receipt.json");
+  assert.equal(existsSync(receiptPath), true);
+  assert.equal(existsSync(join(fixture.stateHomeDirectory, "codex-claude-bridge")), false);
+  assert.ok(fixture.output.join("").includes(bridgeStateDirectory));
+
+  const report = await doctorBridgeInstallation({
+    ...optionsWithoutStateHomeDirectory,
+    listActiveSessions: async () => [],
+  });
+
+  assert.equal(report.checks.find(({ name }) => name === "receipt_phase")?.status, "passed");
+  assert.equal(report.checks.find(({ name }) => name === "state_permissions")?.status, "passed");
+  assert.equal(report.checks.find(({ name }) => name === "integrations")?.status, "passed");
+});
+
 async function pathExistsForTest(candidatePath: string): Promise<boolean> {
   try {
     await lstat(candidatePath);

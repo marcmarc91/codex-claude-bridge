@@ -395,7 +395,12 @@ test("rejects canonical ASCII and Unicode socket paths beyond macOS sun_path", a
         randomSocketIdentifier: () => "aaaaaaaaaaaaaaaa",
         deliverEnvelope: async () => undefined,
       }),
-      /socket path must not exceed 103 UTF-8 bytes/u,
+      (error: unknown) => {
+        assert.ok(error instanceof RangeError);
+        assert.match(error.message, /socket path must not exceed 103 UTF-8 bytes/u);
+        assert.match(error.message, /XDG_STATE_HOME/u);
+        return true;
+      },
     );
   }
 });

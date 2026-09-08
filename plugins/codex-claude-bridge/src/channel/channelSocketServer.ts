@@ -3,6 +3,7 @@ import { chmod, lstat, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { TextDecoder } from "node:util";
+import { assertSocketPathWithinLimit, resolveSocketsDirectory } from "../runtime/paths.js";
 
 import {
   maximumSerializedAgentMessageEnvelopeFrameUtf8Bytes,
@@ -281,9 +282,7 @@ async function listenOnRandomSocket(
       socketsDirectory,
       `c-${randomSocketIdentifier}.sock`,
     );
-    if (Buffer.byteLength(socketPath, "utf8") > 103) {
-      throw new Error("Channel socket path must not exceed 103 UTF-8 bytes");
-    }
+    assertSocketPathWithinLimit(socketPath);
     const server = createServer({ allowHalfOpen: true });
     let socketWasCreated = false;
     try {
@@ -354,10 +353,7 @@ export async function startChannelSocketServer(
   );
   const canonicalStateHomeDirectory =
     bridgeStateContext.canonicalStateTrustRootDirectory;
-  const socketsDirectory = join(
-    bridgeStateContext.bridgeStateDirectory,
-    "sockets",
-  );
+  const socketsDirectory = resolveSocketsDirectory(canonicalStateHomeDirectory);
   await ensurePrivateBridgeDirectory(
     bridgeStateContext,
     socketsDirectory,

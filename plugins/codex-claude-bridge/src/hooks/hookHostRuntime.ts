@@ -88,33 +88,36 @@ function identifyRuntimeFromTranscriptPath(
   return undefined;
 }
 
-function executableBasename(commandLine: string): string {
-  const executableToken = commandLine.trim().split(/\s+/)[0] ?? "";
-  return basename(executableToken);
+function commandLineTokens(commandLine: string): string[] {
+  return commandLine.trim().split(/\s+/);
 }
 
-function nodeScriptArgumentPathSegments(commandLine: string): string[] {
-  return commandLine
-    .trim()
-    .split(/\s+/)
-    .slice(1)
-    .flatMap((argumentToken) => argumentToken.split(sep))
-    .filter((segment) => segment.length > 0);
+function tokenPathSegments(token: string | undefined): string[] {
+  return token === undefined ? [] : pathSegments(token);
 }
 
 function identifyRuntimeFromParentProcessCommandLine(commandLine: string | undefined): RuntimeSignal {
   if (commandLine === undefined || commandLine.length === 0) {
     return undefined;
   }
-  const executableName = executableBasename(commandLine);
+  const [executableToken, scriptToken] = commandLineTokens(commandLine);
+  const executableName = basename(executableToken ?? "");
   if (executableName === "claude") {
     return "claude";
   }
-  if (executableName === "codex" || commandLine.includes("@openai/codex")) {
+  if (executableName === "codex") {
     return "codex";
   }
-  if (executableName === "node" && nodeScriptArgumentPathSegments(commandLine).includes("claude-code")) {
+  if (executableName !== "node") {
+    return undefined;
+  }
+  const scriptSegments = tokenPathSegments(scriptToken);
+  if (scriptSegments.includes("claude-code")) {
     return "claude";
+  }
+  const scriptPath = scriptToken ?? "";
+  if (scriptPath.includes("@openai/codex") || scriptSegments.includes("codex")) {
+    return "codex";
   }
   return undefined;
 }

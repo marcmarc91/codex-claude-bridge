@@ -162,3 +162,44 @@ test("readParentProcessCommandLine se întoarce cu undefined pentru un PID inexi
   const commandLine = await readParentProcessCommandLine(999_999);
   assert.equal(commandLine, undefined);
 });
+
+test("un argument care conține @openai/codex nu transformă un script Claude Code într-un host codex", async () => {
+  const runtime = await identifyHookHostRuntime(
+    { sessionId, parentProcessIdentifier },
+    {
+      readOwningClaudeSession: failingOwningClaudeSessionReader,
+      readParentProcessCommandLine: async () =>
+        "node /opt/node_modules/@anthropic-ai/claude-code/cli.js --add-dir /tmp/@openai/codex",
+      environment: {},
+    },
+  );
+
+  assert.equal(runtime, "claude");
+});
+
+test("un shell ale cărui argumente menționează @openai/codex rămâne 'unknown'", async () => {
+  const runtime = await identifyHookHostRuntime(
+    { sessionId, parentProcessIdentifier },
+    {
+      readOwningClaudeSession: failingOwningClaudeSessionReader,
+      readParentProcessCommandLine: async () => "/bin/zsh -c echo @openai/codex",
+      environment: {},
+    },
+  );
+
+  assert.equal(runtime, "unknown");
+});
+
+test("un script node din pachetul @openai/codex este identificat drept 'codex'", async () => {
+  const runtime = await identifyHookHostRuntime(
+    { sessionId, parentProcessIdentifier },
+    {
+      readOwningClaudeSession: failingOwningClaudeSessionReader,
+      readParentProcessCommandLine: async () =>
+        "node /opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js --cd /tmp/claude-code",
+      environment: {},
+    },
+  );
+
+  assert.equal(runtime, "codex");
+});

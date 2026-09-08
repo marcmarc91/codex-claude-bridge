@@ -292,4 +292,4 @@ python3 "$HOME/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py" 
 
 ## Distribution scope
 
-The current distribution is a source-checkout installation for macOS. It can be cloned and installed by another user who meets the requirements, but the package is intentionally marked private and is not prepared for publication to npm. Repository visibility and source-code reuse rights are separate concerns; add an explicit open-source license before presenting the project as generally reusable software.
+The current distribution is a source-checkout installation for macOS under the [MIT License](LICENSE). It can be cloned and installed by another user who meets the requirements, but the package is intentionally marked private and is not prepared for publication to npm. The package's `private` flag prevents accidental npm publication; it does not restrict the reuse rights granted by the license.

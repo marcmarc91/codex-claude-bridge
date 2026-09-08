@@ -1,6 +1,7 @@
 {
   "name": "codex-claude-bridge-workspace",
   "private": true,
+  "license": "MIT",
   "description": "Development workspace for the local Codex and Claude Code session bridge.",
   "repository": {
     "type": "git",

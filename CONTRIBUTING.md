@@ -28,4 +28,4 @@ Do not commit local agent memory, environment files, credentials, generated buil
 
 ## Distribution and licensing
 
-The repository currently distributes through a source checkout; its packages remain private to prevent accidental npm publication. An open-source license has not yet been selected. Repository visibility does not specify reuse terms. Resolve the licensing policy with the maintainer before submitting third-party code or preparing a public release.
+The repository distributes through a source checkout under the [MIT License](LICENSE); its packages remain private to prevent accidental npm publication. Contributions must be compatible with this license. Preserve applicable copyright and license notices when including third-party code.

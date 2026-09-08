@@ -2,6 +2,7 @@
   "name": "codex-claude-bridge",
   "version": "0.1.1",
   "private": true,
+  "license": "MIT",
   "description": "Local session messaging, acknowledgements and delivery diagnostics for Codex and Claude Code.",
   "repository": {
     "type": "git",

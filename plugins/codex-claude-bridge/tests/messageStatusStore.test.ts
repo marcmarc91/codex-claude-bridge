@@ -381,3 +381,12 @@ test("timeout configuration uses explicit overrides and rejects invalid bounds",
     assert.throws(() => resolveMessageTimeoutMinutes(undefined, value));
   }
 });
+
+test("overdue evaluation accepts an explicit clock and rejects invalid dates", async (testContext) => {
+  const fixture = await createTestState(testContext);
+  const envelope = messageEnvelope();
+  await fixture.store.createPending(envelope, { timeoutMinutes: 5 });
+  assert.deepEqual(await fixture.store.listOverdue(), []);
+  assert.equal((await fixture.store.listOverdue(new Date("2026-09-08T17:05:00.000Z")))[0]?.messageId, envelope.messageId);
+  assert.throws(() => fixture.store.listOverdue(new Date(Number.NaN)));
+});

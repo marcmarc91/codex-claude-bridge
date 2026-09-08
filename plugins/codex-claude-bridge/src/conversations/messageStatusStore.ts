@@ -63,7 +63,7 @@ export interface MessageStatusStore {
   markReplied(messageId: string, recipient: AgentAddress, replyMessageId: string): Promise<MessageStatusRecord>;
   get(messageId: string): Promise<MessageStatusRecord | undefined>;
   findReplyTarget(conversationId: string, recipient: AgentAddress): Promise<MessageStatusRecord | undefined>;
-  listOverdue(): Promise<MessageStatusRecord[]>;
+  listOverdue(now?: Date): Promise<MessageStatusRecord[]>;
 }
 
 export interface CreateMessageStatusStoreOptions {
@@ -172,13 +172,13 @@ export function createMessageStatusStore(options: CreateMessageStatusStoreOption
   const maximumRecords = z.number().int().min(1).max(maximumStoredRecords).parse(options.maximumRecords ?? maximumStoredRecords);
   const retentionMilliseconds = z.number().int().min(1).max(604_800_000).parse(options.retentionMilliseconds ?? 86_400_000);
 
-  async function withStore<Result>(operation: (records: StoredMessageStatus[], now: Date) => Result): Promise<Result> {
+  async function withStore<Result>(operation: (records: StoredMessageStatus[], now: Date) => Result, evaluationDate?: Date): Promise<Result> {
     const context = await prepareSecureBridgeState(options.stateHomeDirectory);
     const directory = await ensurePrivateBridgeDirectory(context, join(context.bridgeStateDirectory, "messages"), true);
     const lockFile = await openOrCreatePrivateRegularFile(context, join(directory, ".mutation.lock"));
     try {
       await acquireMessageStatusLock(lockFile.fileHandle.fd);
-      const now = currentDate();
+      const now = evaluationDate ?? currentDate();
       timestampSchema.parse(now.toISOString());
       const recordPath = join(directory, "statuses.json");
       const storedRecords = await readStatuses(context, recordPath);
@@ -307,12 +307,13 @@ export function createMessageStatusStore(options: CreateMessageStatusStoreOption
         return candidates.length === 1 ? publicStatus(candidates[0]!) : undefined;
       });
     },
-    listOverdue() {
+    listOverdue(requestedDate) {
+      if (requestedDate !== undefined) timestampSchema.parse(requestedDate.toISOString());
       return withStore((records, now) => records.filter((record) =>
         (record.messageType === "question" || record.messageType === "handoff") &&
         record.repliedAt === undefined && record.transportState !== "failed" &&
         Date.parse(record.deadlineAt) <= now.getTime(),
-      ).map(publicStatus));
+      ).map(publicStatus), requestedDate);
     },
   };
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -58,6 +58,14 @@ async function invokeSerializedHookEntry(serializedInput: string, stateHomeDirec
     childProcess.once("close", (exitCode) => resolveProcess({ exitCode, standardOutput }));
     childProcess.stdin.end(serializedInput);
   });
+}
+
+async function writeExecutableShim(shimPath: string, scriptPath: string): Promise<void> {
+  await writeFile(
+    shimPath,
+    `#!/bin/sh\nexec "${process.execPath}" "${scriptPath}" "$@"\n`,
+    { mode: 0o755 },
+  );
 }
 
 async function invokeManifestCommand(
@@ -209,9 +217,9 @@ test("comenzile manifestului rulează dintr-un cache fără dependențe și păs
   });
   await mkdir(temporaryBinaryDirectory, { recursive: true });
   await mkdir(join(stateHomeDirectory, "zsh"), { recursive: true });
-  await symlink(
-    join(pluginDirectory, "dist/bin/codexClaudeBridge.js"),
+  await writeExecutableShim(
     join(temporaryBinaryDirectory, "codex-claude-bridge"),
+    join(pluginDirectory, "dist/bin/codexClaudeBridge.js"),
   );
 
   const manifest = JSON.parse(

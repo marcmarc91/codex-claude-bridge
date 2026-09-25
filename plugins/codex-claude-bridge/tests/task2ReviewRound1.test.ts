@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { findActiveSession, listActiveSessions, registerActiveSession, unregisterActiveSession } from "../src/registry/activeSessionRegistry.js";
 import { resolveBridgeStateDirectory } from "../src/runtime/paths.js";
 
-test("manifestul Codex folosește grupuri matcher cu hook-uri imbricate", async () => {
+test("the Codex manifest uses matcher groups with nested hooks", async () => {
   const manifest = JSON.parse(await readFile(join(fileURLToPath(new URL("..", import.meta.url)), "hooks/hooks.json"), "utf8")) as {
     hooks: Record<string, Array<{ matcher?: string; hooks?: unknown[] }>>;
   };
@@ -19,7 +19,7 @@ test("manifestul Codex folosește grupuri matcher cu hook-uri imbricate", async 
   }
 });
 
-test("înregistrarea respinge ID-uri și directoare de lucru nesigure", async () => {
+test("registration rejects unsafe IDs and working directories", async () => {
   await assert.rejects(() => registerActiveSession({
     schemaVersion: 1,
     runtime: "codex",
@@ -32,7 +32,7 @@ test("înregistrarea respinge ID-uri și directoare de lucru nesigure", async ()
   }));
 });
 
-test("respinge socket-uri Claude non-socket sau symlink și păstrează înregistrarea nouă la dezînregistrare întârziată", async (testContext) => {
+test("rejects non-socket or symlink Claude sockets and keeps the new registration on delayed deregistration", async (testContext) => {
   const stateHomeDirectory = await import("node:fs/promises").then(({ mkdtemp, rm }) => mkdtemp(join(tmpdir(), "ccb-")).then((directory) => {
     testContext.after(() => import("node:fs/promises").then(({ rm }) => rm(directory, { recursive: true, force: true })));
     return directory;
@@ -57,7 +57,7 @@ test("respinge socket-uri Claude non-socket sau symlink și păstrează înregis
   assert.equal((await findActiveSession(freshRecord.sessionId, { projectId }, stateHomeDirectory))?.displayName, "fresh");
 });
 
-test("respinge ID-uri duplicate între proiecte fără un filtru care să le distingă", async (testContext) => {
+test("rejects duplicate IDs across projects without a distinguishing filter", async (testContext) => {
   const stateHomeDirectory = await import("node:fs/promises").then(({ mkdtemp, rm }) => mkdtemp(join(tmpdir(), "ccb-")).then((directory) => {
     testContext.after(() => import("node:fs/promises").then(({ rm }) => rm(directory, { recursive: true, force: true })));
     return directory;
@@ -70,7 +70,7 @@ test("respinge ID-uri duplicate între proiecte fără un filtru care să le dis
   assert.equal((await findActiveSession(sessionId, { projectId: record.projectId ?? "0123456789abcdef01234567" }, stateHomeDirectory))?.sessionId, sessionId);
 });
 
-test("consideră EPERM ca proces activ", async (testContext) => {
+test("treats EPERM as an active process", async (testContext) => {
   const stateHomeDirectory = await import("node:fs/promises").then(({ mkdtemp, rm }) => mkdtemp(join(tmpdir(), "ccb-")).then((directory) => {
     testContext.after(() => import("node:fs/promises").then(({ rm }) => rm(directory, { recursive: true, force: true })));
     return directory;

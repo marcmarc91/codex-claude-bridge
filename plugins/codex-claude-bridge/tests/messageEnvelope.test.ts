@@ -26,19 +26,19 @@ const validEnvelope = {
   content: "status?",
 };
 
-test("acceptă un envelope valid", () => {
+test("accepts a valid envelope", () => {
   assert.equal(parseAgentMessageEnvelope(validEnvelope).content, "status?");
 });
 
-test("respinge câmpurile necunoscute", () => {
+test("rejects unknown fields", () => {
   assert.throws(() => parseAgentMessageEnvelope({ ...validEnvelope, extra: true }));
 });
 
-test("respinge un ID de mesaj care nu este UUID", () => {
+test("rejects a message ID that is not a UUID", () => {
   assert.throws(() => parseAgentMessageEnvelope({ ...validEnvelope, messageId: "bad" }));
 });
 
-test("acceptă numai timestamp-uri UTC cu milisecunde în forma toISOString", () => {
+test("accepts only UTC timestamps with milliseconds in toISOString form", () => {
   assert.equal(parseAgentMessageEnvelope(validEnvelope).sentAt, validEnvelope.sentAt);
   for (const sentAt of [
     "2026-09-03T12:00:00Z",
@@ -50,15 +50,15 @@ test("acceptă numai timestamp-uri UTC cu milisecunde în forma toISOString", ()
   }
 });
 
-test("respinge conținutul gol", () => {
+test("rejects empty content", () => {
   assert.throws(() => parseAgentMessageEnvelope({ ...validEnvelope, content: "" }));
 });
 
-test("respinge conținutul peste limita de 65536 octeți UTF-8", () => {
+test("rejects content above the 65536 UTF-8 byte limit", () => {
   assert.throws(() => parseAgentMessageEnvelope({ ...validEnvelope, content: "ă".repeat(32769) }));
 });
 
-test("creează și serializează un envelope valid", () => {
+test("creates and serializes a valid envelope", () => {
   const envelope = createAgentMessageEnvelope({
     conversationId: validEnvelope.conversationId,
     messageType: validEnvelope.messageType,

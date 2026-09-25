@@ -123,7 +123,7 @@ async function invokeManifestCommand(
   });
 }
 
-test("hook-ul Codex înregistrează și elimină numai sesiunea specificată", async (testContext) => {
+test("the Codex hook registers and removes only the specified session", async (testContext) => {
   const stateHomeDirectory = await mkdtemp(join(tmpdir(), "codex-claude-bridge-"));
   const originalStateHomeDirectory = process.env.XDG_STATE_HOME;
   process.env.XDG_STATE_HOME = stateHomeDirectory;
@@ -165,7 +165,7 @@ test("hook-ul Codex înregistrează și elimină numai sesiunea specificată", a
   );
 });
 
-test("entrypoint-ul compilat execută hook-ul din manifest fără stdout și ignoră stdin malformat", async (testContext) => {
+test("the compiled entry point runs the manifest hook without stdout and ignores malformed stdin", async (testContext) => {
   const stateHomeDirectory = await mkdtemp(join(tmpdir(), "ccb-"));
   testContext.after(() => rm(stateHomeDirectory, { recursive: true, force: true }));
   await executeFile(join(pluginDirectory, "node_modules/.bin/tsc"), ["-p", "tsconfig.json"], { cwd: pluginDirectory });
@@ -186,7 +186,7 @@ test("entrypoint-ul compilat execută hook-ul din manifest fără stdout și ign
   assert.equal((await invokeSerializedHookEntry("{", stateHomeDirectory)).exitCode, 0);
 });
 
-test("hook-ul oprește citirea imediat ce stdin depășește limita UTF-8", async () => {
+test("the hook stops reading as soon as stdin exceeds the UTF-8 limit", async () => {
   let readPastLimit = false;
   const oversizedInput = {
     async *[Symbol.asyncIterator]() {
@@ -202,7 +202,7 @@ test("hook-ul oprește citirea imediat ce stdin depășește limita UTF-8", asyn
   assert.equal(readPastLimit, false);
 });
 
-test("comenzile manifestului rulează dintr-un cache fără dependențe și păstrează ciclul de viață al PID-ului părinte", async (testContext) => {
+test("manifest commands run from a dependency-free cache and keep the parent PID lifecycle", async (testContext) => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "ccb-manifest-"));
   const stateHomeDirectory = join(temporaryDirectory, "state");
   const cachedPluginDirectory = join(temporaryDirectory, "plugin-cache");
@@ -313,10 +313,10 @@ async function withIsolatedStateHomeDirectory(
 }
 
 async function failingOwningClaudeSessionReader(): Promise<never> {
-  throw new Error("metadata indisponibilă");
+  throw new Error("metadata unavailable");
 }
 
-test("hook-ul nu înregistrează sesiunile deținute de Claude Code când metadata se potrivește", async (testContext) => {
+test("the hook does not register Claude Code owned sessions when the metadata matches", async (testContext) => {
   await withIsolatedStateHomeDirectory(testContext);
 
   const claudeSessionIdentifier = "7b2f8c31-4d5a-4e6b-9c0d-1a2b3c4d5e6f";
@@ -338,7 +338,7 @@ test("hook-ul nu înregistrează sesiunile deținute de Claude Code când metada
   assert.deepEqual(await listActiveSessions({ projectId: projectIdentifier }), []);
 });
 
-test("hook-ul nu înregistrează un subagent Claude Code când metadata eșuează dar procesul părinte este claude", async (testContext) => {
+test("the hook does not register a Claude Code subagent when the metadata fails but the parent process is claude", async (testContext) => {
   await withIsolatedStateHomeDirectory(testContext);
 
   const sessionIdentifier = "7b2f8c31-4d5a-4e6b-9c0d-1a2b3c4d5e6f";
@@ -358,7 +358,7 @@ test("hook-ul nu înregistrează un subagent Claude Code când metadata eșueaz�
   assert.deepEqual(await listActiveSessions({ projectId: projectIdentifier }), []);
 });
 
-test("hook-ul înregistrează sesiunea ca 'codex' când metadata eșuează dar procesul părinte este binarul codex", async (testContext) => {
+test("the hook registers the session as 'codex' when the metadata fails but the parent process is the codex binary", async (testContext) => {
   await withIsolatedStateHomeDirectory(testContext);
 
   const sessionIdentifier = "5a6f9c31-4d5a-4e6b-9c0d-1a2b3c4d5eab";
@@ -380,7 +380,7 @@ test("hook-ul înregistrează sesiunea ca 'codex' când metadata eșuează dar p
   assert.equal(registeredSessions[0]?.runtime, "codex");
 });
 
-test("hook-ul înregistrează sesiunea ca 'codex' pornind de la transcript_path sub .codex când procesul părinte e necunoscut", async (testContext) => {
+test("the hook registers the session as 'codex' from a transcript_path under .codex when the parent process is unknown", async (testContext) => {
   await withIsolatedStateHomeDirectory(testContext);
 
   const sessionIdentifier = "1234abcd-4d5a-4e6b-9c0d-1a2b3c4d5eab";
@@ -403,7 +403,7 @@ test("hook-ul înregistrează sesiunea ca 'codex' pornind de la transcript_path 
   assert.equal(registeredSessions[0]?.runtime, "codex");
 });
 
-test("hook-ul dezînregistrează la SessionEnd chiar dacă acel invocare este identificată drept 'claude'", async (testContext) => {
+test("the hook deregisters on SessionEnd even when that invocation is identified as 'claude'", async (testContext) => {
   await withIsolatedStateHomeDirectory(testContext);
 
   const sessionIdentifier = "3344abcd-4d5a-4e6b-9c0d-1a2b3c4d5eab";
@@ -434,7 +434,7 @@ test("hook-ul dezînregistrează la SessionEnd chiar dacă acel invocare este id
   assert.deepEqual(await listActiveSessions({ projectId: projectIdentifier }), []);
 });
 
-test("hook-ul nu înregistrează și nu aruncă nicio eroare când toate dovezile despre rulanță sunt necunoscute", async (testContext) => {
+test("the hook neither registers nor throws when all runtime evidence is unknown", async (testContext) => {
   await withIsolatedStateHomeDirectory(testContext);
 
   const sessionIdentifier = "9988abcd-4d5a-4e6b-9c0d-1a2b3c4d5eab";

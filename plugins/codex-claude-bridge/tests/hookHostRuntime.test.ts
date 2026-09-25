@@ -10,10 +10,10 @@ const sessionId = "3c4b3c10-21a7-4d6f-b964-3c816b9ed8db";
 const parentProcessIdentifier = 4242;
 
 async function failingOwningClaudeSessionReader(): Promise<never> {
-  throw new Error("metadata indisponibilă");
+  throw new Error("metadata unavailable");
 }
 
-test("evidența metadatelor Claude câștigă în fața ambiguității restului dovezilor", async () => {
+test("Claude metadata evidence wins over the ambiguity of the remaining evidence", async () => {
   const runtime = await identifyHookHostRuntime(
     {
       sessionId,
@@ -34,7 +34,7 @@ test("evidența metadatelor Claude câștigă în fața ambiguității restului 
   assert.equal(runtime, "claude");
 });
 
-test("identifică 'codex' din linia de comandă a procesului părinte când metadata eșuează", async () => {
+test("identifies 'codex' from the parent process command line when the metadata fails", async () => {
   const runtime = await identifyHookHostRuntime(
     { sessionId, parentProcessIdentifier },
     {
@@ -47,7 +47,7 @@ test("identifică 'codex' din linia de comandă a procesului părinte când meta
   assert.equal(runtime, "codex");
 });
 
-test("identifică 'claude' dintr-un proces node ai cărui parametri conțin claude", async () => {
+test("identifies 'claude' from a node process whose arguments contain claude", async () => {
   const runtime = await identifyHookHostRuntime(
     { sessionId, parentProcessIdentifier },
     {
@@ -61,7 +61,7 @@ test("identifică 'claude' dintr-un proces node ai cărui parametri conțin clau
   assert.equal(runtime, "claude");
 });
 
-test("identifică 'codex' dintr-un transcript_path aflat sub .codex când restul dovezilor sunt necunoscute", async () => {
+test("identifies 'codex' from a transcript_path under .codex when the remaining evidence is unknown", async () => {
   const runtime = await identifyHookHostRuntime(
     {
       sessionId,
@@ -78,7 +78,7 @@ test("identifică 'codex' dintr-un transcript_path aflat sub .codex când restul
   assert.equal(runtime, "codex");
 });
 
-test("identifică 'claude' dintr-un transcript_path aflat sub directorul Claude configurat", async () => {
+test("identifies 'claude' from a transcript_path under the configured Claude directory", async () => {
   const runtime = await identifyHookHostRuntime(
     {
       sessionId,
@@ -96,7 +96,7 @@ test("identifică 'claude' dintr-un transcript_path aflat sub directorul Claude 
   assert.equal(runtime, "claude");
 });
 
-test("semnalul slab de mediu CLAUDECODE identifică 'claude' numai când nicio altă dovadă nu identifică rulanța", async () => {
+test("the weak CLAUDECODE environment signal identifies 'claude' only when no other evidence identifies the runtime", async () => {
   const runtime = await identifyHookHostRuntime(
     { sessionId, parentProcessIdentifier },
     {
@@ -109,7 +109,7 @@ test("semnalul slab de mediu CLAUDECODE identifică 'claude' numai când nicio a
   assert.equal(runtime, "claude");
 });
 
-test("dovada codex a transcript_path rămâne validă chiar dacă mediul ambiant conține semnalul slab CLAUDECODE", async () => {
+test("the transcript_path codex evidence stays valid even when the environment contains the weak CLAUDECODE signal", async () => {
   const runtime = await identifyHookHostRuntime(
     {
       sessionId,
@@ -126,7 +126,7 @@ test("dovada codex a transcript_path rămâne validă chiar dacă mediul ambiant
   assert.equal(runtime, "codex");
 });
 
-test("environment nu constituie niciodată dovadă pentru codex", async () => {
+test("the environment never counts as evidence for codex", async () => {
   const runtime = await identifyHookHostRuntime(
     { sessionId, parentProcessIdentifier },
     {
@@ -139,7 +139,7 @@ test("environment nu constituie niciodată dovadă pentru codex", async () => {
   assert.equal(runtime, "unknown");
 });
 
-test("returnează 'unknown' fără să arunce eroare când nicio dovadă nu identifică rulanța", async () => {
+test("returns 'unknown' without throwing when no evidence identifies the runtime", async () => {
   const runtime = await identifyHookHostRuntime(
     { sessionId, parentProcessIdentifier },
     {
@@ -152,18 +152,18 @@ test("returnează 'unknown' fără să arunce eroare când nicio dovadă nu iden
   assert.equal(runtime, "unknown");
 });
 
-test("readParentProcessCommandLine citește linia de comandă a unui proces existent fără să arunce eroare", async () => {
+test("readParentProcessCommandLine reads the command line of an existing process without throwing", async () => {
   const commandLine = await readParentProcessCommandLine(process.pid);
   assert.equal(typeof commandLine, "string");
   assert.ok((commandLine ?? "").length > 0);
 });
 
-test("readParentProcessCommandLine se întoarce cu undefined pentru un PID inexistent", async () => {
+test("readParentProcessCommandLine returns undefined for a nonexistent PID", async () => {
   const commandLine = await readParentProcessCommandLine(999_999);
   assert.equal(commandLine, undefined);
 });
 
-test("un argument care conține @openai/codex nu transformă un script Claude Code într-un host codex", async () => {
+test("an argument containing @openai/codex does not turn a Claude Code script into a codex host", async () => {
   const runtime = await identifyHookHostRuntime(
     { sessionId, parentProcessIdentifier },
     {
@@ -177,7 +177,7 @@ test("un argument care conține @openai/codex nu transformă un script Claude Co
   assert.equal(runtime, "claude");
 });
 
-test("un shell ale cărui argumente menționează @openai/codex rămâne 'unknown'", async () => {
+test("a shell whose arguments mention @openai/codex stays 'unknown'", async () => {
   const runtime = await identifyHookHostRuntime(
     { sessionId, parentProcessIdentifier },
     {
@@ -190,7 +190,7 @@ test("un shell ale cărui argumente menționează @openai/codex rămâne 'unknow
   assert.equal(runtime, "unknown");
 });
 
-test("un script node din pachetul @openai/codex este identificat drept 'codex'", async () => {
+test("a node script from the @openai/codex package is identified as 'codex'", async () => {
   const runtime = await identifyHookHostRuntime(
     { sessionId, parentProcessIdentifier },
     {
@@ -204,7 +204,7 @@ test("un script node din pachetul @openai/codex este identificat drept 'codex'",
   assert.equal(runtime, "codex");
 });
 
-test("un director de proiect numit codex sau un pachet cu prefix asemănător nu este dovadă de host codex", async () => {
+test("a project directory named codex or a package with a similar prefix is not evidence of a codex host", async () => {
   for (const commandLine of [
     "node /tmp/codex/helper.js",
     "node /tmp/@openai/codex-not-runtime/tool.js",

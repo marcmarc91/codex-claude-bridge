@@ -29,7 +29,7 @@ function assertPathIsContained(parentDirectory: string, childDirectory: string):
   );
 }
 
-test("worktree-ul Git partajează identitatea proiectului cu repository-ul principal", async (testContext) => {
+test("a Git worktree shares the project identity with the main repository", async (testContext) => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "codex-claude-bridge-"));
   const repositoryDirectory = join(temporaryDirectory, "repository");
   const worktreeDirectory = join(temporaryDirectory, "worktree");
@@ -57,7 +57,7 @@ test("worktree-ul Git partajează identitatea proiectului cu repository-ul princ
   );
 });
 
-test("directorul non-Git are identitate deterministă", async (testContext) => {
+test("a non-Git directory has a deterministic identity", async (testContext) => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "codex-claude-bridge-"));
   testContext.after(async () => rm(temporaryDirectory, { recursive: true, force: true }));
 
@@ -67,7 +67,7 @@ test("directorul non-Git are identitate deterministă", async (testContext) => {
   );
 });
 
-test("toate directoarele runtime valide rămân structural sub rădăcina de stare selectată", () => {
+test("all valid runtime directories stay structurally under the selected state root", () => {
   const stateRootDirectory = join(tmpdir(), "codex-claude-bridge-state");
   const projectIdentity = "0123456789abcdef01234567";
   const bridgeStateDirectory = resolveBridgeStateDirectory(stateRootDirectory);
@@ -83,7 +83,7 @@ test("toate directoarele runtime valide rămân structural sub rădăcina de sta
   );
 });
 
-test("acceptă UUID v7 pentru conversații la fel ca envelope-ul protocolului", () => {
+test("accepts UUID v7 for conversations just like the protocol envelope", () => {
   const stateRootDirectory = join(tmpdir(), "codex-claude-bridge-state");
   const projectIdentity = "0123456789abcdef01234567";
   const uuidVersion7 = "018f1c57-9bd7-7f64-a9d3-9d7c90a3039c";
@@ -114,7 +114,7 @@ test("acceptă UUID v7 pentru conversații la fel ca envelope-ul protocolului", 
   assertPathIsContained(resolveBridgeStateDirectory(stateRootDirectory), conversationDirectory);
 });
 
-test("respinge identificatorii de proiect care pot traversa directoare", () => {
+test("rejects project identifiers that can traverse directories", () => {
   const stateRootDirectory = join(tmpdir(), "codex-claude-bridge-state");
   const conversationIdentifier = "5cb1e2fd-5b24-4699-bfea-878e9b147370";
 
@@ -125,7 +125,7 @@ test("respinge identificatorii de proiect care pot traversa directoare", () => {
   }
 });
 
-test("respinge identificatorii de conversație care pot traversa directoare", () => {
+test("rejects conversation identifiers that can traverse directories", () => {
   const stateRootDirectory = join(tmpdir(), "codex-claude-bridge-state");
 
   for (const conversationIdentifier of ["../escape", "nested/path", "/tmp/escape"]) {
@@ -135,7 +135,7 @@ test("respinge identificatorii de conversație care pot traversa directoare", ()
   }
 });
 
-test("tratează XDG_STATE_HOME gol ca absent și folosește directorul implicit", (testContext) => {
+test("treats an empty XDG_STATE_HOME as absent and uses the default directory", (testContext) => {
   const originalStateHomeDirectory = process.env.XDG_STATE_HOME;
   process.env.XDG_STATE_HOME = "";
   testContext.after(() => {
@@ -152,7 +152,7 @@ test("tratează XDG_STATE_HOME gol ca absent și folosește directorul implicit"
   );
 });
 
-test("respinge valori XDG_STATE_HOME relative, whitespace și cu NUL", (testContext) => {
+test("rejects relative, whitespace and NUL-containing XDG_STATE_HOME values", (testContext) => {
   const originalProcessEnvironment = process.env;
   testContext.after(() => {
     process.env = originalProcessEnvironment;
@@ -171,7 +171,7 @@ test("respinge valori XDG_STATE_HOME relative, whitespace și cu NUL", (testCont
   }
 });
 
-test("respinge toate rădăcinile injectate invalide înainte de I/O", async (testContext) => {
+test("rejects all invalid injected roots before any I/O", async (testContext) => {
   const temporaryWorkingDirectory = await mkdtemp(join(tmpdir(), "ccb-invalid-root-"));
   const originalWorkingDirectory = process.cwd();
   process.chdir(temporaryWorkingDirectory);
@@ -200,7 +200,7 @@ test("respinge toate rădăcinile injectate invalide înainte de I/O", async (te
   assert.deepEqual(await import("node:fs/promises").then(({ readdir }) => readdir(".")), []);
 });
 
-test("păstrează rădăcinile absolute valide injectate", () => {
+test("keeps valid injected absolute roots", () => {
   const absoluteStateHomeDirectory = join(tmpdir(), "ccb-valid-state-root");
 
   assert.equal(
@@ -209,7 +209,7 @@ test("păstrează rădăcinile absolute valide injectate", () => {
   );
 });
 
-test("resolveStateHomeDirectory respectă XDG_STATE_HOME dintr-un obiect de mediu injectat", () => {
+test("resolveStateHomeDirectory honors XDG_STATE_HOME from an injected environment object", () => {
   const environmentStateHomeDirectory = join(tmpdir(), "ccb-injected-environment-state");
 
   assert.equal(
@@ -218,7 +218,7 @@ test("resolveStateHomeDirectory respectă XDG_STATE_HOME dintr-un obiect de medi
   );
 });
 
-test("resolveStateHomeDirectory ignoră XDG_STATE_HOME din process.env când mediul injectat nu îl conține", (testContext) => {
+test("resolveStateHomeDirectory ignores XDG_STATE_HOME from process.env when the injected environment lacks it", (testContext) => {
   const originalStateHomeDirectory = process.env.XDG_STATE_HOME;
   process.env.XDG_STATE_HOME = join(tmpdir(), "ccb-real-process-env-state");
   testContext.after(() => {
@@ -235,7 +235,7 @@ test("resolveStateHomeDirectory ignoră XDG_STATE_HOME din process.env când med
   );
 });
 
-test("rădăcina de stare injectată are prioritate față de XDG_STATE_HOME din mediu", () => {
+test("an injected state root takes precedence over XDG_STATE_HOME from the environment", () => {
   const injectedStateHomeDirectory = join(tmpdir(), "ccb-injected-override-state");
   const environmentStateHomeDirectory = join(tmpdir(), "ccb-ignored-environment-state");
 
@@ -247,7 +247,7 @@ test("rădăcina de stare injectată are prioritate față de XDG_STATE_HOME din
   );
 });
 
-test("resolveBridgeStateDirectory propagă mediul injectat către rezolvarea XDG", () => {
+test("resolveBridgeStateDirectory propagates the injected environment to the XDG resolution", () => {
   const environmentStateHomeDirectory = join(tmpdir(), "ccb-bridge-environment-state");
 
   assert.equal(
@@ -256,7 +256,7 @@ test("resolveBridgeStateDirectory propagă mediul injectat către rezolvarea XDG
   );
 });
 
-test("resolveSocketsDirectory folosește <stateDir>/sockets sub directorul de stare", () => {
+test("resolveSocketsDirectory uses <stateDir>/sockets under the state directory", () => {
   const stateHomeDirectory = join(tmpdir(), "ccb-sockets-default-state");
 
   assert.equal(
@@ -265,7 +265,7 @@ test("resolveSocketsDirectory folosește <stateDir>/sockets sub directorul de st
   );
 });
 
-test("assertSocketPathWithinLimit acceptă căi în limita de octeți UTF-8", () => {
+test("assertSocketPathWithinLimit accepts paths within the UTF-8 byte limit", () => {
   const shortSocketPath = join(tmpdir(), "c-0123456789abcdef.sock");
   const exactLimitSocketPath = `/${"é".repeat(51)}`;
 
@@ -275,7 +275,7 @@ test("assertSocketPathWithinLimit acceptă căi în limita de octeți UTF-8", ()
   assert.throws(() => assertSocketPathWithinLimit(`${exactLimitSocketPath}a`), RangeError);
 });
 
-test("assertSocketPathWithinLimit aruncă RangeError cu limita, lungimea efectivă și variabila de remediu", () => {
+test("assertSocketPathWithinLimit throws a RangeError with the limit, the actual length and the remedy variable", () => {
   const oversizedSocketPath = join(
     "/",
     "a".repeat(200),

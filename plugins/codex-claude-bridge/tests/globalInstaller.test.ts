@@ -1807,7 +1807,7 @@ test("serializes install and uninstall so uninstall observes the completed recei
   );
 });
 
-test("install și doctor derivă același director de stare implicit din XDG_STATE_HOME când stateHomeDirectory nu este injectat", async (testContext) => {
+test("install and doctor derive the same default state directory from XDG_STATE_HOME when stateHomeDirectory is not injected", async (testContext) => {
   const fixture = await createTestOptions(testContext);
   const xdgStateHomeDirectory = join(dirname(fixture.stateHomeDirectory), "xdg-state-home");
   const originalXdgStateHomeDirectory = process.env.XDG_STATE_HOME;

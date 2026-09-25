@@ -105,7 +105,7 @@ async function createLiveClaudeSocket(
   return socketPath;
 }
 
-test("elimină un socket orfan, nereferit de nicio sesiune și fără proces care ascultă", async (testContext) => {
+test("removes an orphaned socket that no session references and no process listens on", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const socketsDirectory = join(resolveBridgeStateDirectory(stateHomeDirectory), "sockets");
   await mkdir(socketsDirectory, { recursive: true, mode: 0o700 });
@@ -119,7 +119,7 @@ test("elimină un socket orfan, nereferit de nicio sesiune și fără proces car
   await assert.rejects(() => lstat(orphanSocketPath), { code: "ENOENT" });
 });
 
-test("păstrează un socket viu chiar dacă nu e referit de nicio înregistrare de sesiune", async (testContext) => {
+test("keeps a live socket even when no session record references it", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const socketPath = await createLiveClaudeSocket(
     testContext,
@@ -133,7 +133,7 @@ test("păstrează un socket viu chiar dacă nu e referit de nicio înregistrare 
   assert.equal((await lstat(socketPath)).isSocket(), true);
 });
 
-test("elimină o înregistrare de sesiune al cărei proces e mort", async (testContext) => {
+test("removes a session record whose process is dead", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const deadRecord = createRecord({ processId: 999_999 });
   await registerActiveSession(deadRecord, stateHomeDirectory);
@@ -150,7 +150,7 @@ test("elimină o înregistrare de sesiune al cărei proces e mort", async (testC
   await assert.rejects(() => lstat(recordPath), { code: "ENOENT" });
 });
 
-test("raportează corect un sumar cu toate categoriile de stare orfană combinate", async (testContext) => {
+test("reports a correct summary with all orphaned state categories combined", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
 
   const deadRecord = createRecord({ processId: 999_999 });
@@ -182,7 +182,7 @@ test("raportează corect un sumar cu toate categoriile de stare orfană combinat
   assert.equal((await lstat(liveRecordPath)).isFile(), true);
 });
 
-test("nu se blochează la o înregistrare coruptă și omite doar trecerea de socket-uri pentru acel proiect", async (testContext) => {
+test("does not stall on a corrupted record and skips only the socket pass for that project", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const record = createRecord();
   await registerActiveSession(record, stateHomeDirectory);

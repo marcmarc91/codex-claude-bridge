@@ -84,7 +84,7 @@ async function createUnixSocket(
   );
 }
 
-test("înregistrează atomic sesiuni și păstrează permisiunile private", async (testContext) => {
+test("registers sessions atomically and keeps private permissions", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const record = createRecord();
 
@@ -102,7 +102,7 @@ test("înregistrează atomic sesiuni și păstrează permisiunile private", asyn
   );
 });
 
-test("filtrează, găsește ID-uri unice și respinge nume ambigue", async (testContext) => {
+test("filters, resolves unique IDs and rejects ambiguous names", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const firstRecord = createRecord();
   const secondRecord = createRecord({
@@ -133,7 +133,7 @@ test("filtrează, găsește ID-uri unice și respinge nume ambigue", async (test
   );
 });
 
-test("elimină procesele moarte și sesiunile Claude fără socket", async (testContext) => {
+test("removes dead processes and Claude sessions without a socket", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const deadRecord = createRecord({ processId: 999999 });
   const disconnectedClaudeRecord = createRecord({
@@ -151,7 +151,7 @@ test("elimină procesele moarte și sesiunile Claude fără socket", async (test
   );
 });
 
-test("respinge un symlink folosit drept director intermediar sessions", async (testContext) => {
+test("rejects a symlink used as the intermediate sessions directory", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const bridgeStateDirectory = resolveBridgeStateDirectory(stateHomeDirectory);
   const redirectedSessionsDirectory = join(stateHomeDirectory, "redirected-sessions");
@@ -163,7 +163,7 @@ test("respinge un symlink folosit drept director intermediar sessions", async (t
   assert.deepEqual(await readdir(redirectedSessionsDirectory), []);
 });
 
-test("respinge un symlink folosit drept director intermediar de proiect", async (testContext) => {
+test("rejects a symlink used as the intermediate project directory", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const bridgeStateDirectory = resolveBridgeStateDirectory(stateHomeDirectory);
   const sessionsDirectory = join(bridgeStateDirectory, "sessions");
@@ -178,7 +178,7 @@ test("respinge un symlink folosit drept director intermediar de proiect", async 
   assert.deepEqual(await readdir(redirectedRegistryDirectory), []);
 });
 
-test("respinge symlink-uri finale de record la citire, scriere și eliminare", async (testContext) => {
+test("rejects record symlinks on read, write and removal", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const record = createRecord();
   await registerActiveSession(record, stateHomeDirectory);
@@ -213,7 +213,7 @@ test("respinge symlink-uri finale de record la citire, scriere și eliminare", a
   assert.equal((await lstat(recordPath)).isSymbolicLink(), true);
 });
 
-test("respinge record-uri cu mod neprivat și păstrează proprietarul curent", async (testContext) => {
+test("rejects records with a non-private mode and keeps the current owner", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const record = createRecord();
   await registerActiveSession(record, stateHomeDirectory);
@@ -238,7 +238,7 @@ test("respinge record-uri cu mod neprivat și păstrează proprietarul curent", 
   );
 });
 
-test("elimină un record al cărui proiect sau ID nu corespunde căii", async (testContext) => {
+test("removes a record whose project or ID does not match its path", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const record = createRecord();
   await registerActiveSession(record, stateHomeDirectory);
@@ -263,7 +263,7 @@ test("elimină un record al cărui proiect sau ID nu corespunde căii", async (t
   await assert.rejects(() => stat(recordPath), { code: "ENOENT" });
 });
 
-test("curăță fișierul temporar când mutația record-ului eșuează", async (testContext) => {
+test("cleans up the temporary file when the record mutation fails", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const record = createRecord();
   await registerActiveSession(record, stateHomeDirectory);
@@ -287,7 +287,7 @@ test("curăță fișierul temporar când mutația record-ului eșuează", async 
   );
 });
 
-test("acceptă numai modul exact 0600 pentru un socket Claude activ", async (testContext) => {
+test("accepts only the exact 0600 mode for an active Claude socket", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const socketPath = await createClaudeSocket(testContext, stateHomeDirectory);
   const claudeRecord = createRecord({
@@ -314,7 +314,7 @@ test("acceptă numai modul exact 0600 pentru un socket Claude activ", async (tes
   );
 });
 
-test("respinge un director intermediar de socket care este symlink", async (testContext) => {
+test("rejects an intermediate socket directory that is a symlink", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const bridgeStateDirectory = resolveBridgeStateDirectory(stateHomeDirectory);
   const socketTargetDirectory = join(stateHomeDirectory, "socket-target");
@@ -343,7 +343,7 @@ test("respinge un director intermediar de socket care este symlink", async (test
   assert.equal((await lstat(actualSocketPath)).isSocket(), true);
 });
 
-test("înregistrarea și dezînregistrarea concurente păstrează proprietarul proaspăt", async (testContext) => {
+test("concurrent registration and deregistration keep the fresh owner", async (testContext) => {
   const stateHomeDirectory = await createStateHomeDirectory(testContext);
   const originalRecord = createRecord({ processId: process.pid });
   const freshRecord = createRecord({
@@ -374,7 +374,7 @@ test("înregistrarea și dezînregistrarea concurente păstrează proprietarul p
   );
 });
 
-test("probeUnixSocketOutcome distinge acceptarea, refuzul cert și cazul incert", async () => {
+test("probeUnixSocketOutcome distinguishes acceptance, definite refusal and the uncertain case", async () => {
   const { mkdtemp, rm, writeFile } = await import("node:fs/promises");
   const { probeUnixSocketOutcome } = await import("../src/registry/activeSessionRegistry.js");
   const probeDirectory = await mkdtemp(join(tmpdir(), "ccb-probe-"));
